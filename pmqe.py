@@ -616,7 +616,6 @@ class ExtractorApp(QWidget):
     def _init_ui(self) -> None:
         self.setWindowTitle("PDF & Image Multi-Query Extractor")
         self.setMinimumSize(950, 500)
-        self.resize(1280, 720) 
 
         main_layout = QHBoxLayout(self)
         main_layout.setSpacing(15)
@@ -864,7 +863,7 @@ def main() -> None:
     _setup_logging()
     app = QApplication(sys.argv)
     window = ExtractorApp()
-    window.show()
+    window.showNormal()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
