@@ -488,12 +488,17 @@ def update_metrics_db(db_path: str, counts: dict[str, int]) -> None:
 
 def export_metrics_csv(db_path: str, csv_path: str) -> None:
     con = sqlite3.connect(db_path)
+    # Kept database query intact (ordered alphabetically by query)
     rows = con.execute("SELECT query, page_count FROM metrics ORDER BY query").fetchall()
     con.close()
+    
+    # Sort the retrieved data rows by match count (row[1]) lowest-to-highest in Python memory
+    sorted_rows = sorted(rows, key=lambda row: row[1])
+    
     with open(_unc(csv_path), "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["query", "match count"])
-        w.writerows(rows)
+        w.writerows(sorted_rows)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # QThread Process Orchestrator
@@ -771,19 +776,80 @@ class ExtractorApp(QWidget):
         self.status_label.setText(f"[{elapsed:.1f}s]  {msg}")
 
     def _on_finished(self, counts: dict[str, int]) -> None:
-        elapsed = time.monotonic() - self._t0
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(100)
-        self.btn_run.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
-        self.status_label.setText(f"Status: Complete in {elapsed:.1f}s -- metrics.db saved to destination folder")
-        
-        self.result_table.setRowCount(len(counts))
-        for row, (q, cnt) in enumerate(counts.items()):
-            self.result_table.setItem(row, 0, QTableWidgetItem(q))
-            item = QTableWidgetItem(str(cnt))
-            item.setTextAlignment(Qt.AlignCenter)
-            self.result_table.setItem(row, 1, item)
+            elapsed = time.monotonic() - self._t0
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100)
+            self.btn_run.setEnabled(True)
+            self.btn_cancel.setEnabled(False)
+            self.status_label.setText(f"Status: Complete in {elapsed:.1f}s -- metrics.db saved to destination folder")
+            
+            self.result_table.setRowCount(len(counts))
+            
+            # 1. Adjust UI Column Sizes to a 70:30 ratio layout
+            total_width = self.result_table.viewport().width()
+            if total_width <= 0:  # Fallback if window layout hasn't fully rendered its geometry yet
+                total_width = self.result_table.width()
+            self.result_table.setColumnWidth(0, int(total_width * 0.70))
+            self.result_table.setColumnWidth(1, int(total_width * 0.30))
+            
+            # Calculate the majority (mode) baseline dynamically from the actual counts
+            if counts:
+                from collections import Counter
+                majority_baseline = Counter(counts.values()).most_common(1)[0][0]
+            else:
+                majority_baseline = 0
+                
+            # Explicitly import everything needed for styling and UI item generation
+            from PySide6.QtGui import QColor, QBrush
+            from PySide6.QtWidgets import QTableWidgetItem
+            
+            # 0 [ dark magenta white bold text ]
+            zero_bg = QBrush(QColor("#8B008B"))
+            zero_fg = QBrush(QColor("#FFFFFF"))
+            
+            # under [ blood red background white bold text ]
+            under_bg = QBrush(QColor("#8B0000"))
+            under_fg = QBrush(QColor("#FFFFFF"))
+            
+            # over [ yellow-ish bg make sure text visible both light and dark mode ]
+            over_bg = QBrush(QColor("#FFF2CC"))
+            over_fg = QBrush(QColor("#202020"))  # Charcoal text for high contrast
+            
+            # 2. Sort items by match count from lowest to highest for UI display
+            sorted_counts = sorted(counts.items(), key=lambda item: item[1])
+            
+            for row, (q, cnt) in enumerate(sorted_counts):
+                # Column 0: Query Name
+                query_item = QTableWidgetItem(q)
+                self.result_table.setItem(row, 0, query_item)
+                
+                # Column 1: Match Count
+                count_item = QTableWidgetItem(str(cnt))
+                count_item.setTextAlignment(Qt.AlignCenter)
+                
+                # Apply styling rules based on the dynamic majority baseline
+                if cnt == 0:
+                    count_item.setBackground(zero_bg)
+                    count_item.setForeground(zero_fg)
+                    font = count_item.font()
+                    font.setBold(True)
+                    count_item.setFont(font)
+                    
+                elif cnt < majority_baseline:
+                    count_item.setBackground(under_bg)
+                    count_item.setForeground(under_fg)
+                    font = count_item.font()
+                    font.setBold(True)
+                    count_item.setFont(font)
+                    
+                elif cnt > majority_baseline:
+                    count_item.setBackground(over_bg)
+                    count_item.setForeground(over_fg)
+                    font = count_item.font()
+                    font.setBold(True)
+                    count_item.setFont(font)
+                    
+                self.result_table.setItem(row, 1, count_item)
 
     def _on_error(self, msg: str) -> None:
         self.progress_bar.setRange(0, 100)
