@@ -42,10 +42,10 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageOps
 import pillow_heif
 
-from PySide6.QtCore import Qt, QThread, Signal, QModelIndex, QItemSelectionModel
+from PySide6.QtCore import Qt, QThread, Signal, QModelIndex, QItemSelectionModel, QEvent
 from PySide6.QtGui import QColor, QBrush, QPixmap, QImage, QTransform, QStandardItemModel, QStandardItem
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QAbstractItemView, QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QProgressBar, QPushButton, QTableWidget,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget, QFrame,
     QTabWidget, QTreeView, QGraphicsView, QGraphicsScene, QSplitter
@@ -416,12 +416,15 @@ class ProcessingWorker(QThread):
         except Exception as e:
             log.error(f"Failed to generate output metrics/reports: {e}")
 
+
 class ExtractorApp(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._worker: ProcessingWorker | None = None
         self.review_records: list[dict] = []
         self.current_review_item: dict | None = None
+        # Live aggregate counts kept in sync with approve/reject actions
+        self._live_counts: dict[str, int] = {}
         self.zoom_factor = 1.0
         self.current_rotation = 0
         self.view_text_mode = False
@@ -505,9 +508,62 @@ class ExtractorApp(QWidget):
         self.tree_model = QStandardItemModel()
         self.tree_model.setHorizontalHeaderLabels(["Query Elements / Page Index Hierarchy"])
         self.review_tree.setModel(self.tree_model)
-        
-        # Connected to selectionModel for synchronized arrow/mouse highlight navigation
-        self.review_tree.selectionModel().currentChanged.connect(self._tree_selection_changed)
+
+        # ExtendedSelection (not SingleSelection) keeps the highlight painted on
+        # the current row during keyboard navigation on all platform styles.
+        # SingleSelection can drop the visual highlight when the item changes.
+        self.review_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+        # By default Qt only paints the hover highlight on actual mouse hover.
+        # Keyboard "current" gets a thin focus rect that is nearly invisible on
+        # most themes.  This stylesheet makes hover, selected, current-with-focus,
+        # and current-without-focus all render with the same vivid background so
+        # keyboard nav is exactly as visible as mouse nav.
+        self.review_tree.setStyleSheet("""
+/* 1. Fix the main tree view to disable the focus outline globally */
+QTreeView {
+    outline: 0;
+}
+
+/* 2. Apply border resets to ALL item states to prevent standard borders from leaking in */
+QTreeView::item {
+    border: 0px solid transparent;
+}
+
+QTreeView::item:hover {
+    background: rgba(70, 130, 200, 0.45);
+    color: white;
+}
+
+QTreeView::item:selected {
+    background: rgba(70, 130, 200, 0.70);
+    color: white;
+}
+
+QTreeView::item:selected:!focus {
+    background: rgba(70, 130, 200, 0.50);
+    color: white;
+}
+
+QTreeView::item:focus {
+    background: rgba(70, 130, 200, 0.70);
+    color: white;
+    border: 0px solid transparent;
+}
+        """)
+
+        # installEventFilter lets us intercept key events before Qt's internal
+        # selection machinery runs, ensuring _activate_index fires on every
+        # keyboard move regardless of what the selection model does internally.
+        self.review_tree.installEventFilter(self)
+
+        # Two separate hooks — mouse clicks via clicked, keyboard nav via
+        # currentChanged — mirroring the working reference implementation.
+        # Both funnel into the same _activate_index handler.
+        self.review_tree.clicked.connect(self._activate_index)
+        self.review_tree.selectionModel().currentChanged.connect(
+            lambda cur, _prev: self._activate_index(cur)
+        )
         
         left_review_layout.addWidget(QLabel("Extracted Targets / Candidates Tree View"))
         left_review_layout.addWidget(self.review_tree)
@@ -599,14 +655,62 @@ class ExtractorApp(QWidget):
         self.progress_bar.setRange(0, 100); self.progress_bar.setValue(100)
         self.status_label.setText("Batch run finished. Reports generated in destination output path.")
         self.review_records = review_data
+        # Seed the live counts so approve/reject can delta against it
+        self._live_counts = dict(counts)
         
+        self._refresh_metrics_table()
+        self._rebuild_review_tree()
+        self.tabs.setCurrentWidget(self.tab_review)
+
+    # ------------------------------------------------------------------
+    # FIX 2: Centralised metrics refresh so the table, CSV, and DB all
+    # stay in sync whenever _live_counts is mutated by approve/reject.
+    # ------------------------------------------------------------------
+    def _refresh_metrics_table(self) -> None:
+        counts = self._live_counts
         self.result_table.setRowCount(len(counts))
         for idx, (q, c) in enumerate(sorted(counts.items(), key=lambda x: x[1])):
             self.result_table.setItem(idx, 0, QTableWidgetItem(q))
             self.result_table.setItem(idx, 1, QTableWidgetItem(str(c)))
 
-        self._rebuild_review_tree()
-        self.tabs.setCurrentWidget(self.tab_review)
+    def _persist_metrics(self) -> None:
+        """Rewrite report.csv and update extraction_history.db to match _live_counts."""
+        output_dir = self.output_edit.text().strip()
+        if not output_dir:
+            return
+        out_path = Path(output_dir)
+        try:
+            out_path.mkdir(parents=True, exist_ok=True)
+            # CSV
+            csv_file = out_path / "report.csv"
+            with open(csv_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Query", "Total Approved Hits"])
+                for q, c in self._live_counts.items():
+                    writer.writerow([q, c])
+            # DB – update summary_metrics and candidates_log approval state
+            db_file = out_path / "extraction_history.db"
+            conn = sqlite3.connect(str(db_file))
+            cursor = conn.cursor()
+            cursor.execute("CREATE TABLE IF NOT EXISTS summary_metrics (query TEXT PRIMARY KEY, hits INTEGER)")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS candidates_log (
+                    id TEXT PRIMARY KEY, query TEXT, file_path TEXT, page_index INTEGER, pre_approved INTEGER
+                )
+            """)
+            cursor.executemany(
+                "INSERT OR REPLACE INTO summary_metrics VALUES (?,?)",
+                list(self._live_counts.items()),
+            )
+            log_rows = [
+                (item["id"], item["query"], item["file_path"], item["page_idx"], 1 if item["pre_approved"] else 0)
+                for item in self.review_records
+            ]
+            cursor.executemany("INSERT OR REPLACE INTO candidates_log VALUES (?,?,?,?,?)", log_rows)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            log.error("Failed to persist metrics after review action: %s", e)
 
     def _rebuild_review_tree(self) -> None:
         selected_id = self.current_review_item["id"] if self.current_review_item else None
@@ -649,19 +753,41 @@ class ExtractorApp(QWidget):
                     target_node_to_select = page_node
         
         self.review_tree.expandAll()
-        
+
+        # tree_model.clear() replaces the underlying QItemSelectionModel, which
+        # orphans any connection made at init time.  Reconnect both signals on
+        # the fresh selection model so keyboard and mouse both stay live.
+        self.review_tree.selectionModel().currentChanged.connect(
+            lambda cur, _prev: self._activate_index(cur)
+        )
+
         if target_node_to_select:
             idx = self.tree_model.indexFromItem(target_node_to_select)
             self.review_tree.selectionModel().setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
 
-    def _tree_selection_changed(self, current: QModelIndex, previous: QModelIndex) -> None:
-        node = self.tree_model.itemFromIndex(current)
+    def _activate_index(self, index: QModelIndex) -> None:
+        node = self.tree_model.itemFromIndex(index)
         if not node: return
         item_data = node.data(Qt.UserRole)
         if not item_data: return
 
         self.current_review_item = item_data
         self._render_selected_element()
+
+    def eventFilter(self, obj, event) -> bool:
+        """Intercept key presses on the tree so currentChanged fires before Qt
+        can interfere with the visual selection state."""
+        if obj is self.review_tree and event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right,
+                       Qt.Key_PageUp, Qt.Key_PageDown, Qt.Key_Home, Qt.Key_End):
+                # Let Qt move current normally, then manually activate whatever
+                # landed on.  We call the base class first so the tree moves,
+                # then read back currentIndex().
+                result = super().eventFilter(obj, event)
+                self._activate_index(self.review_tree.currentIndex())
+                return result
+        return super().eventFilter(obj, event)
 
     def _render_selected_element(self) -> None:
         if not self.current_review_item: return
@@ -761,8 +887,13 @@ class ExtractorApp(QWidget):
                     shutil.copy2(item["file_path"], folder / f"{p_obj.stem}_approved_{item['file_hash']}{p_obj.suffix}")
                     
                 item["pre_approved"] = True
-                
-                # In-place style updates to keep focus highlighted and turn the node green
+
+                # FIX 2: bump live count and sync all downstream targets
+                self._live_counts[item["query"]] = self._live_counts.get(item["query"], 0) + 1
+                self._refresh_metrics_table()
+                self._persist_metrics()
+
+                # In-place style update — keep focus on this node
                 current_index = self.review_tree.selectionModel().currentIndex()
                 if current_index.isValid():
                     node = self.tree_model.itemFromIndex(current_index)
@@ -783,14 +914,33 @@ class ExtractorApp(QWidget):
             try:
                 folder = Path(self.output_edit.text().strip()) / safe_folder_name(item["query"])
                 p_obj = Path(item["file_path"])
-                
-                target_path = folder / (f"{p_obj.stem}_{item['file_hash']}.pdf" if p_obj.suffix.lower() == ".pdf" else f"{p_obj.stem}_{item['file_hash']}{p_obj.suffix}")
-                if target_path.exists():
-                    target_path.unlink()
-                
+                is_pdf = p_obj.suffix.lower() == ".pdf"
+                ext = p_obj.suffix if not is_pdf else ".pdf"
+
+                # FIX 3: check all filename variants that could exist in the
+                # output folder — batch-run uses stem_hash, manual approve uses
+                # stem_approved_hash.  Delete whichever one is present.
+                candidates = [
+                    folder / f"{p_obj.stem}_{item['file_hash']}{ext}",
+                    folder / f"{p_obj.stem}_approved_{item['file_hash']}{ext}",
+                ]
+                deleted_any = False
+                for target_path in candidates:
+                    if target_path.exists():
+                        target_path.unlink()
+                        deleted_any = True
+
+                if not deleted_any:
+                    log.warning("Reject: no output file found to delete for item %s", item["id"])
+
                 item["pre_approved"] = False
-                
-                # In-place style updates to turn the node back to candidate orange
+
+                # FIX 2: decrement live count (floor at 0) and sync all targets
+                self._live_counts[item["query"]] = max(0, self._live_counts.get(item["query"], 1) - 1)
+                self._refresh_metrics_table()
+                self._persist_metrics()
+
+                # In-place style update — keep focus on this node
                 current_index = self.review_tree.selectionModel().currentIndex()
                 if current_index.isValid():
                     node = self.tree_model.itemFromIndex(current_index)
