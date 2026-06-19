@@ -42,7 +42,7 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageOps
 import pillow_heif
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QModelIndex, QItemSelectionModel
 from PySide6.QtGui import QColor, QBrush, QPixmap, QImage, QTransform, QStandardItemModel, QStandardItem
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
@@ -290,6 +290,7 @@ def process_file(
                     match_counts[query] += 1
                 
                 review_items.append({
+                    "id": f"{file_hash}_{index}_{qi}",
                     "query": query,
                     "file_path": file_path,
                     "file_hash": file_hash,
@@ -379,7 +380,41 @@ class ProcessingWorker(QThread):
                 except Exception as exc:
                     self.progress_signal.emit(done, total, f"[FAIL] {Path(f_path).name}: {exc}")
 
+        self._write_reports(aggregate_counts, master_review_data)
         self.finished_signal.emit(aggregate_counts, master_review_data)
+
+    def _write_reports(self, counts: dict[str, int], review_data: list[dict]) -> None:
+        try:
+            out_path = Path(self.output_dir)
+            out_path.mkdir(parents=True, exist_ok=True)
+            
+            csv_file = out_path / "report.csv"
+            with open(csv_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Query", "Total Approved Hits"])
+                for q, c in counts.items():
+                    writer.writerow([q, c])
+                    
+            db_file = out_path / "extraction_history.db"
+            conn = sqlite3.connect(str(db_file))
+            cursor = conn.cursor()
+            cursor.execute("CREATE TABLE IF NOT EXISTS summary_metrics (query TEXT PRIMARY KEY, hits INTEGER)")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS candidates_log (
+                    id TEXT PRIMARY KEY, query TEXT, file_path TEXT, page_index INTEGER, pre_approved INTEGER
+                )
+            """)
+            cursor.executemany("INSERT OR REPLACE INTO summary_metrics VALUES (?,?)", list(counts.items()))
+            
+            log_rows = [
+                (item["id"], item["query"], item["file_path"], item["page_idx"], 1 if item["pre_approved"] else 0)
+                for item in review_data
+            ]
+            cursor.executemany("INSERT OR REPLACE INTO candidates_log VALUES (?,?,?,?,?)", log_rows)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            log.error(f"Failed to generate output metrics/reports: {e}")
 
 class ExtractorApp(QWidget):
     def __init__(self) -> None:
@@ -418,7 +453,6 @@ class ExtractorApp(QWidget):
         left_panel.addWidget(QLabel("Queries:"))
         left_panel.addWidget(self.query_edit, stretch=1)
 
-        # RESTORED: Import queries from .txt file button
         btn_import = QPushButton("Import Queries from .txt File")
         btn_import.clicked.connect(self._import_txt)
         left_panel.addWidget(btn_import)
@@ -453,7 +487,13 @@ class ExtractorApp(QWidget):
         left_review_widget = QWidget()
         left_review_layout = QVBoxLayout(left_review_widget)
         
-        # Tree Tree Utility Controls (Expand/Collapse All)
+        search_layout = QHBoxLayout()
+        search_layout.addWidget(QLabel("Filter Query:"))
+        self.search_bar = QLineEdit(placeholderText="Type query to filter tree panel...")
+        self.search_bar.textChanged.connect(self._rebuild_review_tree)
+        search_layout.addWidget(self.search_bar)
+        left_review_layout.addLayout(search_layout)
+
         tree_utility_row = QHBoxLayout()
         btn_expand_all = QPushButton("Expand All"); btn_expand_all.clicked.connect(self.review_tree_expand)
         btn_collapse_all = QPushButton("Collapse All"); btn_collapse_all.clicked.connect(self.review_tree_collapse)
@@ -465,7 +505,10 @@ class ExtractorApp(QWidget):
         self.tree_model = QStandardItemModel()
         self.tree_model.setHorizontalHeaderLabels(["Query Elements / Page Index Hierarchy"])
         self.review_tree.setModel(self.tree_model)
-        self.review_tree.clicked.connect(self._tree_item_selected)
+        
+        # Connected to selectionModel for synchronized arrow/mouse highlight navigation
+        self.review_tree.selectionModel().currentChanged.connect(self._tree_selection_changed)
+        
         left_review_layout.addWidget(QLabel("Extracted Targets / Candidates Tree View"))
         left_review_layout.addWidget(self.review_tree)
         splitter.addWidget(left_review_widget)
@@ -554,7 +597,7 @@ class ExtractorApp(QWidget):
     def _on_finished(self, counts: dict[str, int], review_data: list[dict]):
         self.btn_run.setEnabled(True); self.btn_cancel.setEnabled(False)
         self.progress_bar.setRange(0, 100); self.progress_bar.setValue(100)
-        self.status_label.setText("Batch run finished. Verification assets mapped to Review Tab.")
+        self.status_label.setText("Batch run finished. Reports generated in destination output path.")
         self.review_records = review_data
         
         self.result_table.setRowCount(len(counts))
@@ -566,57 +609,58 @@ class ExtractorApp(QWidget):
         self.tabs.setCurrentWidget(self.tab_review)
 
     def _rebuild_review_tree(self) -> None:
-            self.tree_model.clear()
-            self.tree_model.setHorizontalHeaderLabels(["Query Target Layout Mapping Tree"])
-            
-            query_buckets = defaultdict(list)
-            for item in self.review_records:
-                query_buckets[item["query"]].append(item)
+        selected_id = self.current_review_item["id"] if self.current_review_item else None
+        
+        self.tree_model.clear()
+        self.tree_model.setHorizontalHeaderLabels(["Query Target Layout Mapping Tree"])
+        
+        search_filter = self.search_bar.text().strip().lower()
+        query_buckets = defaultdict(list)
+        for item in self.review_records:
+            if search_filter and search_filter not in item["query"].lower():
+                continue
+            query_buckets[item["query"]].append(item)
 
-            for query, items in query_buckets.items():
-                query_node = QStandardItem(query)
-                query_node.setSelectable(False)
-                self.tree_model.appendRow(query_node)
+        target_node_to_select = None
 
-                # Sort strategy: Lesser missing words float directly to the top
-                sorted_items = sorted(items, key=lambda x: len(x["missing_words"]))
+        for query, items in query_buckets.items():
+            query_node = QStandardItem(query)
+            query_node.setSelectable(False)
+            self.tree_model.appendRow(query_node)
 
-                for item in sorted_items:
-                    p_name = Path(item["file_path"]).name
-                    display_label = f"Page {item['page_idx'] + 1} -> {p_name}"
-                    
-                    if item["pre_approved"]:
-                        display_label += " [PRE-APPROVED MATCH]"
-                        page_node = QStandardItem(display_label)
-                        page_node.setForeground(QBrush(QColor("#27ae60")))
-                    else:
-                        page_node = QStandardItem()
-                        # Create the blood-red background badge for each missing word
-                        missing_styled = " ".join([f'<span style="background-color:#8b0000; color:#ffffff; font-weight:bold; padding:2px; border-radius:3px;">{w}</span>' for w in item["missing_words"]])
-                        
-                        # FIXED: Added the missing words directly into the item display label using HTML parsing rules
-                        page_node.setText(f"Page {item['page_idx'] + 1} -> {p_name} [CANDIDATE] | Missing: ")
-                        
-                        # Appending a secondary item or embedding HTML strings natively in text works best via tooltips or adjacent node labels. 
-                        # To display raw HTML inside standard QTreeView nodes without custom delegates, we can format the text explicitly:
-                        page_node.setText(f"Page {item['page_idx'] + 1} -> {p_name} [CANDIDATE] (Missing: {', '.join(item['missing_words'])})")
-                        page_node.setToolTip(f"Missing terms: {', '.join(item['missing_words'])}")
-                        page_node.setForeground(QBrush(QColor("#d35400")))
-                    
-                    page_node.setData(item, Qt.UserRole)
-                    query_node.appendRow(page_node)
-            
-            self.review_tree.expandAll()
+            sorted_items = sorted(items, key=lambda x: len(x["missing_words"]))
 
-    def _tree_item_selected(self, index) -> None:
-        node = self.tree_model.itemFromIndex(index)
+            for item in sorted_items:
+                p_name = Path(item["file_path"]).name
+                page_node = QStandardItem()
+                
+                if item["pre_approved"]:
+                    page_node.setText(f"Page {item['page_idx'] + 1} -> {p_name} [APPROVED]")
+                    page_node.setForeground(QBrush(QColor("#27ae60")))
+                else:
+                    page_node.setText(f"Page {item['page_idx'] + 1} -> {p_name} [CANDIDATE] (Missing: {', '.join(item['missing_words'])})")
+                    page_node.setToolTip(f"Missing terms: {', '.join(item['missing_words'])}")
+                    page_node.setForeground(QBrush(QColor("#d35400")))
+                
+                page_node.setData(item, Qt.UserRole)
+                query_node.appendRow(page_node)
+                
+                if selected_id and item["id"] == selected_id:
+                    target_node_to_select = page_node
+        
+        self.review_tree.expandAll()
+        
+        if target_node_to_select:
+            idx = self.tree_model.indexFromItem(target_node_to_select)
+            self.review_tree.selectionModel().setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+
+    def _tree_selection_changed(self, current: QModelIndex, previous: QModelIndex) -> None:
+        node = self.tree_model.itemFromIndex(current)
         if not node: return
         item_data = node.data(Qt.UserRole)
         if not item_data: return
 
         self.current_review_item = item_data
-        self.zoom_factor = 1.0
-        self.current_rotation = 0
         self._render_selected_element()
 
     def _render_selected_element(self) -> None:
@@ -632,11 +676,8 @@ class ExtractorApp(QWidget):
                 self.text_preview.setPlainText("[No text layer parsed inside cache storage framework]")
                 return
 
-            # Highlight exact token matches in brilliant yellow
             tokens = [w.strip() for w in item["query"].split() if len(w.strip()) > 1]
             html_text = raw_text
-            
-            # Escape basic HTML characters to prevent rendering collision bugs
             html_text = html_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             
             for token in tokens:
@@ -644,7 +685,6 @@ class ExtractorApp(QWidget):
                     pattern = re.compile(re.escape(token), re.IGNORECASE)
                     html_text = pattern.sub(lambda m: f'<span style="background-color: #ffff00; color: #000000; font-weight: bold;">{m.group(0)}</span>', html_text)
             
-            # Format display carriage breaks cleanly
             html_text = html_text.replace("\n", "<br>")
             self.text_preview.setHtml(f"<div style='font-family: monospace; font-size: 12px;'>{html_text}</div>")
         else:
@@ -721,8 +761,17 @@ class ExtractorApp(QWidget):
                     shutil.copy2(item["file_path"], folder / f"{p_obj.stem}_approved_{item['file_hash']}{p_obj.suffix}")
                     
                 item["pre_approved"] = True
-                QMessageBox.information(self, "Status Synchronization", "Candidate page approved and exported to output successfully.")
-                self._rebuild_review_tree()
+                
+                # In-place style updates to keep focus highlighted and turn the node green
+                current_index = self.review_tree.selectionModel().currentIndex()
+                if current_index.isValid():
+                    node = self.tree_model.itemFromIndex(current_index)
+                    if node:
+                        p_name = Path(item["file_path"]).name
+                        node.setText(f"Page {item['page_idx'] + 1} -> {p_name} [APPROVED]")
+                        node.setForeground(QBrush(QColor("#27ae60")))
+                        node.setData(item, Qt.UserRole)
+                        
             except Exception as e:
                 QMessageBox.critical(self, "I/O Error", f"Failed manual export sequence: {e}")
 
@@ -740,8 +789,17 @@ class ExtractorApp(QWidget):
                     target_path.unlink()
                 
                 item["pre_approved"] = False
-                QMessageBox.information(self, "Status Synchronization", "Page extraction rejected and physical file purged successfully.")
-                self._rebuild_review_tree()
+                
+                # In-place style updates to turn the node back to candidate orange
+                current_index = self.review_tree.selectionModel().currentIndex()
+                if current_index.isValid():
+                    node = self.tree_model.itemFromIndex(current_index)
+                    if node:
+                        p_name = Path(item["file_path"]).name
+                        node.setText(f"Page {item['page_idx'] + 1} -> {p_name} [CANDIDATE] (Missing: {', '.join(item['missing_words'])})")
+                        node.setForeground(QBrush(QColor("#d35400")))
+                        node.setData(item, Qt.UserRole)
+                        
             except Exception as e:
                 QMessageBox.critical(self, "I/O Error", f"Failed cleanup sequence: {e}")
 
