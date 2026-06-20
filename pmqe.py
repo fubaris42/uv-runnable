@@ -30,63 +30,118 @@ import logging.handlers
 import multiprocessing
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 import ahocorasick
 import fitz  # PyMuPDF
-from PIL import Image, ImageOps
 import pillow_heif
+from PIL import Image, ImageOps
 
-from PySide6.QtCore import Qt, QThread, Signal, QModelIndex, QItemSelectionModel, QEvent
-from PySide6.QtGui import QColor, QBrush, QPixmap, QImage, QTransform, QStandardItemModel, QStandardItem
+from PySide6.QtCore import QEvent, QItemSelectionModel, QModelIndex, Qt, QThread, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QImage,
+    QPixmap,
+    QStandardItem,
+    QStandardItemModel,
+    QTransform,
+)
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QProgressBar, QPushButton, QTableWidget,
-    QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget, QFrame,
-    QTabWidget, QTreeView, QGraphicsView, QGraphicsScene, QSplitter
+    QAbstractItemView,
+    QApplication,
+    QFileDialog,
+    QGraphicsScene,
+    QGraphicsView,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSplitter,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QTreeView,
+    QVBoxLayout,
+    QWidget,
 )
 
 pillow_heif.register_heif_opener()
 
-OCR_DPI            = 200          
-OCR_SAMPLE_PAGES   = 5            
-OCR_SAMPLE_THRESH  = 200          
-CONTENT_HASH_BYTES = 1_048_576    
-LOG_MAX_BYTES      = 5_242_880    
-LOG_BACKUP_COUNT   = 3
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+OCR_DPI = 200
+OCR_SAMPLE_PAGES = 5
+OCR_SAMPLE_THRESH = 200
+CONTENT_HASH_BYTES = 1_048_576
+LOG_MAX_BYTES = 5_242_880
+LOG_BACKUP_COUNT = 3
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heif"}
-SUPPORTED_EXTENSIONS = {".pdf"}.union(IMAGE_EXTENSIONS)
+SUPPORTED_EXTENSIONS = {".pdf"} | IMAGE_EXTENSIONS
 
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+
 def _setup_logging(log_path: str | None = None) -> None:
     root = logging.getLogger()
-    if root.handlers: return
+    if root.handlers:
+        return
     root.setLevel(logging.DEBUG)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"
+    )
     sh = logging.StreamHandler(sys.stderr)
     sh.setLevel(logging.INFO)
     sh.setFormatter(fmt)
     root.addHandler(sh)
     if log_path:
-        fh = logging.handlers.RotatingFileHandler(log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
+        fh = logging.handlers.RotatingFileHandler(
+            log_path,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
         root.addHandler(fh)
 
+
+# ---------------------------------------------------------------------------
+# Path utilities
+# ---------------------------------------------------------------------------
+
+
 def _unc(path: str) -> str:
-    if sys.platform != "win32": return path
+    """Return a \\\\?\\ -prefixed absolute path on Windows to bypass MAX_PATH."""
+    if sys.platform != "win32":
+        return path
     p = os.path.abspath(path)
     return p if p.startswith("\\\\?\\") else "\\\\?\\" + p
 
+
 def safe_folder_name(name: str) -> str:
     return "".join(c for c in name if c.isalnum() or c in (" ", "_", "-")).strip()
+
+
+# ---------------------------------------------------------------------------
+# Content hashing
+# ---------------------------------------------------------------------------
+
 
 def content_hash(path: str) -> str:
     try:
@@ -99,19 +154,45 @@ def content_hash(path: str) -> str:
     except OSError:
         return hashlib.blake2b(path.encode(), digest_size=16).hexdigest()
 
-def build_automaton_payload(queries: list[str]) -> tuple[list[tuple[str, tuple[str, set[int]]]], dict[int, int]]:
+
+# ---------------------------------------------------------------------------
+# Aho-Corasick helpers
+# ---------------------------------------------------------------------------
+
+
+def build_automaton(
+    queries: list[str],
+) -> tuple[ahocorasick.Automaton, dict[str, set[int]]]:
+    """Return a compiled automaton and a token→query-index map."""
     token_qset: dict[str, set[int]] = defaultdict(set)
-    query_token_need: dict[int, int] = {}
     for qi, q in enumerate(queries):
-        parts = [w.lower() for w in q.split() if len(w) > 1]
-        query_token_need[qi] = len(parts)
-        for part in parts:
+        for part in (w.lower() for w in q.split() if len(w) > 1):
             token_qset[part].add(qi)
-    aho_words = [(token, (token, qset)) for token, qset in token_qset.items()]
-    return aho_words, query_token_need
+
+    A = ahocorasick.Automaton()
+    for token, qset in token_qset.items():
+        A.add_word(token, (token, qset))
+    A.make_automaton()
+    return A, token_qset
+
+
+# ---------------------------------------------------------------------------
+# OCR cache (SQLite, per-input-directory)
+# ---------------------------------------------------------------------------
 
 _ocr_cache_conn: sqlite3.Connection | None = None
 _ocr_cache_path: str = ""
+
+_CREATE_CACHE_TABLE = """
+    CREATE TABLE IF NOT EXISTS ocr_cache (
+        content_hash TEXT NOT NULL,
+        page_num     INTEGER NOT NULL,
+        text         TEXT NOT NULL,
+        timestamp    REAL NOT NULL,
+        PRIMARY KEY (content_hash, page_num)
+    )
+"""
+
 
 def _get_cache_conn(db_path: str) -> sqlite3.Connection:
     global _ocr_cache_conn, _ocr_cache_path
@@ -119,50 +200,60 @@ def _get_cache_conn(db_path: str) -> sqlite3.Connection:
         _ocr_cache_conn = sqlite3.connect(db_path, check_same_thread=False)
         _ocr_cache_conn.execute("PRAGMA journal_mode=WAL")
         _ocr_cache_conn.execute("PRAGMA synchronous=NORMAL")
-        _ocr_cache_conn.execute("""
-            CREATE TABLE IF NOT EXISTS ocr_cache (
-                content_hash TEXT NOT NULL,
-                page_num     INTEGER NOT NULL,
-                text         TEXT NOT NULL,
-                timestamp    REAL NOT NULL,
-                PRIMARY KEY (content_hash, page_num)
-            )
-        """)
+        _ocr_cache_conn.execute(_CREATE_CACHE_TABLE)
         _ocr_cache_conn.commit()
         _ocr_cache_path = db_path
     return _ocr_cache_conn
 
+
 def cache_load(db_path: str, file_hash: str, total_pages: int) -> dict[int, str] | None:
     try:
         con = _get_cache_conn(db_path)
-        rows = con.execute("SELECT page_num, text FROM ocr_cache WHERE content_hash=? ORDER BY page_num", (file_hash,)).fetchall()
+        rows = con.execute(
+            "SELECT page_num, text FROM ocr_cache WHERE content_hash=? ORDER BY page_num",
+            (file_hash,),
+        ).fetchall()
         if len(rows) == total_pages:
-            con.execute("UPDATE ocr_cache SET timestamp=? WHERE content_hash=?", (time.time(), file_hash))
+            con.execute(
+                "UPDATE ocr_cache SET timestamp=? WHERE content_hash=?",
+                (time.time(), file_hash),
+            )
             con.commit()
             return {r[0]: r[1] for r in rows}
     except Exception:
         pass
     return None
 
+
 def cache_save(db_path: str, file_hash: str, page_texts: dict[int, str]) -> None:
     try:
         con = _get_cache_conn(db_path)
         now = time.time()
-        con.executemany("INSERT OR REPLACE INTO ocr_cache (content_hash, page_num, text, timestamp) VALUES (?,?,?,?)",
-                        [(file_hash, pn, txt, now) for pn, txt in page_texts.items()])
+        con.executemany(
+            "INSERT OR REPLACE INTO ocr_cache (content_hash, page_num, text, timestamp) VALUES (?,?,?,?)",
+            [(file_hash, pn, txt, now) for pn, txt in page_texts.items()],
+        )
         con.commit()
     except Exception:
         pass
 
+
+# ---------------------------------------------------------------------------
+# Windows OCR pipeline  (worker-process scope – lazy globals reset per spawn)
+# ---------------------------------------------------------------------------
+
 _ocr_loop: asyncio.AbstractEventLoop | None = None
 _ocr_engine: Any = None
+
 
 def _ocr_engine_lazy() -> Any:
     global _ocr_engine
     if _ocr_engine is None:
-        from winrt.windows.media.ocr import OcrEngine
+        from winrt.windows.media.ocr import OcrEngine  # type: ignore[import]
+
         _ocr_engine = OcrEngine.try_create_from_user_profile_languages()
     return _ocr_engine
+
 
 def _ocr_loop_lazy() -> asyncio.AbstractEventLoop:
     global _ocr_loop
@@ -171,10 +262,12 @@ def _ocr_loop_lazy() -> asyncio.AbstractEventLoop:
         asyncio.set_event_loop(_ocr_loop)
     return _ocr_loop
 
+
 async def _decode_bitmap(pil_img: Image.Image) -> Any:
-    from winrt.windows.security.cryptography import CryptographicBuffer
-    from winrt.windows.storage.streams import InMemoryRandomAccessStream
-    from winrt.windows.graphics.imaging import BitmapDecoder
+    from winrt.windows.graphics.imaging import BitmapDecoder  # type: ignore[import]
+    from winrt.windows.security.cryptography import CryptographicBuffer  # type: ignore[import]
+    from winrt.windows.storage.streams import InMemoryRandomAccessStream  # type: ignore[import]
+
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG")
     winrt_buf = CryptographicBuffer.create_from_byte_array(buf.getvalue())
@@ -184,14 +277,16 @@ async def _decode_bitmap(pil_img: Image.Image) -> Any:
     decoder = await BitmapDecoder.create_async(stream)
     return await decoder.get_software_bitmap_async()
 
+
 async def _ocr_pipeline_async(images: list[Image.Image]) -> list[str]:
     engine = _ocr_engine_lazy()
-    if not engine: return [""] * len(images)
+    if not engine:
+        return [""] * len(images)
     try:
         bitmaps = await asyncio.gather(*(_decode_bitmap(img) for img in images))
     except Exception:
         return [""] * len(images)
-    results = []
+    results: list[str] = []
     for bitmap in bitmaps:
         try:
             result = await engine.recognize_async(bitmap)
@@ -200,64 +295,72 @@ async def _ocr_pipeline_async(images: list[Image.Image]) -> list[str]:
             results.append("")
     return results
 
+
 def ocr_all_pages(images: list[Image.Image]) -> list[str]:
-    if not images: return []
+    if not images:
+        return []
     return _ocr_loop_lazy().run_until_complete(_ocr_pipeline_async(images))
+
 
 def render_page(page: fitz.Page, dpi: int = OCR_DPI) -> Image.Image:
     pix = page.get_pixmap(dpi=dpi)
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
+
+# ---------------------------------------------------------------------------
+# Core per-file processing  (runs in worker processes)
+# ---------------------------------------------------------------------------
+
+
 def process_file(
     file_path: str,
     queries: list[str],
-    automaton_payload: tuple[list[tuple[str, tuple[str, set[int]]]], dict[int, int]],
     output_dir: str,
     cache_db: str,
     log_path: str,
 ) -> dict[str, Any]:
     _setup_logging(log_path)
-    
-    aho_words, query_token_need = automaton_payload
-    A = ahocorasick.Automaton()
-    for word, payload in aho_words:
-        A.add_word(word, payload)
-    A.make_automaton()
+
+    A, _token_qset = build_automaton(queries)
 
     p_obj = Path(file_path)
-    file_name = p_obj.name
     file_ext = p_obj.suffix.lower()
     file_hash = content_hash(file_path)
-    is_pdf = (file_ext == ".pdf")
+    is_pdf = file_ext == ".pdf"
 
     page_texts: dict[int, str] = {}
-    total_items = 0
 
+    # ---- extract text (or OCR) ----------------------------------------
     if is_pdf:
         try:
             doc = fitz.open(_unc(file_path))
-            total_items = len(doc)
-        except Exception:
+        except Exception as exc:
+            log.error("Cannot open PDF %s: %s", file_path, exc)
             return {"counts": {}, "review_data": []}
-    else:
-        total_items = 1
 
-    cached = cache_load(cache_db, file_hash, total_items)
-    if cached is not None:
-        page_texts = cached
-    else:
-        if is_pdf:
-            sample_n = min(OCR_SAMPLE_PAGES, total_items)
+        total_pages = len(doc)
+        cached = cache_load(cache_db, file_hash, total_pages)
+        if cached is not None:
+            page_texts = cached
+            doc.close()
+        else:
+            sample_n = min(OCR_SAMPLE_PAGES, total_pages)
             sample_chars = sum(len(doc[i].get_text() or "") for i in range(sample_n))
             if sample_chars >= OCR_SAMPLE_THRESH:
-                for i in range(total_items):
+                for i in range(total_pages):
                     page_texts[i] = doc[i].get_text() or ""
+                doc.close()
             else:
-                images = [render_page(doc[i]) for i in range(total_items)]
+                images = [render_page(doc[i]) for i in range(total_pages)]
+                doc.close()
                 results = ocr_all_pages(images)
                 page_texts = {i: t for i, t in enumerate(results)}
                 cache_save(cache_db, file_hash, page_texts)
-            doc.close()
+    else:
+        total_pages = 1
+        cached = cache_load(cache_db, file_hash, total_pages)
+        if cached is not None:
+            page_texts = cached
         else:
             try:
                 with Image.open(file_path) as img:
@@ -265,76 +368,97 @@ def process_file(
                     results = ocr_all_pages([img_corrected.convert("RGB")])
                     page_texts = {0: results[0] if results else ""}
                     cache_save(cache_db, file_hash, page_texts)
-            except Exception:
+            except Exception as exc:
+                log.error("Cannot open image %s: %s", file_path, exc)
                 return {"counts": {}, "review_data": []}
 
-    match_counts = {q: 0 for q in queries}
-    review_items = []
+    # ---- match queries against extracted text --------------------------
+    match_counts: dict[str, int] = {q: 0 for q in queries}
+    review_items: list[dict] = []
 
-    for index, raw_text in page_texts.items():
+    for page_idx, raw_text in page_texts.items():
         clean = raw_text.lower().replace(" ", "")
-        
+
         for qi, query in enumerate(queries):
             tokens = [w.lower() for w in query.split() if len(w) > 1]
-            found_tokens = set()
-            
+            found_tokens: set[str] = set()
+
             for _, (token, qset) in A.iter(clean):
                 if qi in qset:
                     found_tokens.add(token)
 
             missing_tokens = [t for t in tokens if t not in found_tokens]
-            is_approved = len(missing_tokens) == 0
+            is_approved = not missing_tokens
 
-            if is_approved or (len(found_tokens) > 0 and len(tokens) > 1):
+            # Include fully-approved hits AND partial candidates (≥1 token hit, multi-token query)
+            if is_approved or (found_tokens and len(tokens) > 1):
                 if is_approved:
                     match_counts[query] += 1
-                
-                review_items.append({
-                    "id": f"{file_hash}_{index}_{qi}",
-                    "query": query,
-                    "file_path": file_path,
-                    "file_hash": file_hash,
-                    "page_idx": index,
-                    "pre_approved": is_approved,
-                    "missing_words": missing_tokens,
-                    "text_content": raw_text
-                })
 
-    if is_pdf:
+                review_items.append(
+                    {
+                        "id": f"{file_hash}_{page_idx}_{qi}",
+                        "query": query,
+                        "file_path": file_path,
+                        "file_hash": file_hash,
+                        "page_idx": page_idx,
+                        "pre_approved": is_approved,
+                        "missing_words": missing_tokens,
+                        "text_content": raw_text,
+                    }
+                )
+
+    # ---- write approved pages to output folder -------------------------
+    approved_by_query: dict[str, list[int]] = defaultdict(list)
+    for item in review_items:
+        if item["pre_approved"]:
+            approved_by_query[item["query"]].append(item["page_idx"])
+
+    if is_pdf and approved_by_query:
         try:
             doc = fitz.open(_unc(file_path))
-            pdf_hits = defaultdict(list)
-            for item in review_items:
-                if item["pre_approved"]:
-                    pdf_hits[item["query"]].append(item["page_idx"])
-                    
-            for q, p_list in pdf_hits.items():
+            for q, pages in approved_by_query.items():
                 folder = Path(output_dir) / safe_folder_name(q)
                 folder.mkdir(parents=True, exist_ok=True)
                 out_doc = fitz.open()
-                for pn in p_list:
+                for pn in pages:
                     out_doc.insert_pdf(doc, from_page=pn, to_page=pn)
-                out_doc.save(_unc(str(folder / f"{p_obj.stem}_{file_hash}.pdf")), garbage=4, deflate=True)
+                out_doc.save(
+                    _unc(str(folder / f"{p_obj.stem}_{file_hash}.pdf")),
+                    garbage=4,
+                    deflate=True,
+                )
                 out_doc.close()
             doc.close()
-        except Exception:
-            pass
-    else:
-        for item in review_items:
-            if item["pre_approved"]:
-                folder = Path(output_dir) / safe_folder_name(item["query"])
+        except Exception as exc:
+            log.error("Failed to write PDF output for %s: %s", file_path, exc)
+    elif not is_pdf:
+        for q, pages in approved_by_query.items():
+            if pages:  # images are single-page; just copy once
+                folder = Path(output_dir) / safe_folder_name(q)
                 folder.mkdir(parents=True, exist_ok=True)
-                import shutil
                 shutil.copy2(file_path, folder / f"{p_obj.stem}_{file_hash}{file_ext}")
 
     return {"counts": match_counts, "review_data": review_items}
 
+
+# ---------------------------------------------------------------------------
+# Background processing thread
+# ---------------------------------------------------------------------------
+
+
 class ProcessingWorker(QThread):
     progress_signal = Signal(int, int, str)
     finished_signal = Signal(dict, list)
-    error_signal    = Signal(str)
+    error_signal = Signal(str)
 
-    def __init__(self, input_dir: str, queries: list[str], output_dir: str, max_workers: int | None = None) -> None:
+    def __init__(
+        self,
+        input_dir: str,
+        queries: list[str],
+        output_dir: str,
+        max_workers: int | None = None,
+    ) -> None:
         super().__init__()
         self.input_dir = input_dir
         self.queries = queries
@@ -342,12 +466,17 @@ class ProcessingWorker(QThread):
         self.max_workers = max_workers or max(1, (os.cpu_count() or 4) - 1)
         self._cancel = False
 
-    def cancel(self): self._cancel = True
+    def cancel(self) -> None:
+        self._cancel = True
 
     def run(self) -> None:
-        all_files = [str(p) for p in Path(self.input_dir).rglob("*") if p.suffix.lower() in SUPPORTED_EXTENSIONS]
+        all_files = [
+            str(p)
+            for p in Path(self.input_dir).rglob("*")
+            if p.suffix.lower() in SUPPORTED_EXTENSIONS
+        ]
         if not all_files:
-            self.error_signal.emit("No supported assets parsed inside target folder.")
+            self.error_signal.emit("No supported assets found inside target folder.")
             return
 
         total = len(all_files)
@@ -355,14 +484,20 @@ class ProcessingWorker(QThread):
         log_path = _unc(os.path.join(self.output_dir, "extractor.log"))
         _setup_logging(log_path)
 
-        aho_payload = build_automaton_payload(self.queries)
-        aggregate_counts = {q: 0 for q in self.queries}
-        master_review_data = []
+        aggregate_counts: dict[str, int] = {q: 0 for q in self.queries}
+        master_review_data: list[dict] = []
 
         ctx = multiprocessing.get_context("spawn")
-        with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers, mp_context=ctx) as executor:
-            future_map = {executor.submit(process_file, f, self.queries, aho_payload, self.output_dir, cache_db, log_path): f for f in all_files}
-            
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=self.max_workers, mp_context=ctx
+        ) as executor:
+            future_map = {
+                executor.submit(
+                    process_file, f, self.queries, self.output_dir, cache_db, log_path
+                ): f
+                for f in all_files
+            }
+
             done = 0
             for future in concurrent.futures.as_completed(future_map):
                 if self._cancel:
@@ -376,9 +511,13 @@ class ProcessingWorker(QThread):
                     for q, c in res["counts"].items():
                         aggregate_counts[q] += c
                     master_review_data.extend(res["review_data"])
-                    self.progress_signal.emit(done, total, f"({done}/{total}) {Path(f_path).name}")
+                    self.progress_signal.emit(
+                        done, total, f"({done}/{total}) {Path(f_path).name}"
+                    )
                 except Exception as exc:
-                    self.progress_signal.emit(done, total, f"[FAIL] {Path(f_path).name}: {exc}")
+                    self.progress_signal.emit(
+                        done, total, f"[FAIL] {Path(f_path).name}: {exc}"
+                    )
 
         self._write_reports(aggregate_counts, master_review_data)
         self.finished_signal.emit(aggregate_counts, master_review_data)
@@ -387,34 +526,49 @@ class ProcessingWorker(QThread):
         try:
             out_path = Path(self.output_dir)
             out_path.mkdir(parents=True, exist_ok=True)
-            
-            csv_file = out_path / "report.csv"
-            with open(csv_file, "w", newline="", encoding="utf-8") as f:
+
+            with open(out_path / "report.csv", "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(["Query", "Total Approved Hits"])
-                for q, c in counts.items():
-                    writer.writerow([q, c])
-                    
-            db_file = out_path / "extraction_history.db"
-            conn = sqlite3.connect(str(db_file))
+                writer.writerows(counts.items())
+
+            conn = sqlite3.connect(str(out_path / "extraction_history.db"))
             cursor = conn.cursor()
-            cursor.execute("CREATE TABLE IF NOT EXISTS summary_metrics (query TEXT PRIMARY KEY, hits INTEGER)")
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS summary_metrics (query TEXT PRIMARY KEY, hits INTEGER)"
+            )
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS candidates_log (
-                    id TEXT PRIMARY KEY, query TEXT, file_path TEXT, page_index INTEGER, pre_approved INTEGER
+                    id TEXT PRIMARY KEY, query TEXT, file_path TEXT,
+                    page_index INTEGER, pre_approved INTEGER
                 )
             """)
-            cursor.executemany("INSERT OR REPLACE INTO summary_metrics VALUES (?,?)", list(counts.items()))
-            
-            log_rows = [
-                (item["id"], item["query"], item["file_path"], item["page_idx"], 1 if item["pre_approved"] else 0)
-                for item in review_data
-            ]
-            cursor.executemany("INSERT OR REPLACE INTO candidates_log VALUES (?,?,?,?,?)", log_rows)
+            cursor.executemany(
+                "INSERT OR REPLACE INTO summary_metrics VALUES (?,?)",
+                list(counts.items()),
+            )
+            cursor.executemany(
+                "INSERT OR REPLACE INTO candidates_log VALUES (?,?,?,?,?)",
+                [
+                    (
+                        item["id"],
+                        item["query"],
+                        item["file_path"],
+                        item["page_idx"],
+                        1 if item["pre_approved"] else 0,
+                    )
+                    for item in review_data
+                ],
+            )
             conn.commit()
             conn.close()
-        except Exception as e:
-            log.error(f"Failed to generate output metrics/reports: {e}")
+        except Exception as exc:
+            log.error("Failed to write output reports: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Main application window
+# ---------------------------------------------------------------------------
 
 
 class ExtractorApp(QWidget):
@@ -423,12 +577,15 @@ class ExtractorApp(QWidget):
         self._worker: ProcessingWorker | None = None
         self.review_records: list[dict] = []
         self.current_review_item: dict | None = None
-        # Live aggregate counts kept in sync with approve/reject actions
         self._live_counts: dict[str, int] = {}
         self.zoom_factor = 1.0
         self.current_rotation = 0
         self.view_text_mode = False
         self._init_ui()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
 
     def _init_ui(self) -> None:
         self.setWindowTitle("PDF & Image Multi-Query Extractor & Review HIL Pipeline")
@@ -438,420 +595,529 @@ class ExtractorApp(QWidget):
         self.tabs = QTabWidget()
         window_layout.addWidget(self.tabs)
 
-        # TAB 1: DASHBOARD EXTRACTOR
-        tab_dash = QWidget()
-        dash_layout = QHBoxLayout(tab_dash)
-        dash_layout.setSpacing(15)
-        
-        left_panel = QVBoxLayout()
-        row_in = QHBoxLayout(); self.input_edit = QLineEdit(placeholderText="Input folder...", readOnly=True)
-        btn_in = QPushButton("Browse Input"); btn_in.clicked.connect(self._browse_input)
-        row_in.addWidget(self.input_edit); row_in.addWidget(btn_in); left_panel.addLayout(row_in)
+        self.tabs.addTab(self._build_dashboard_tab(), "Data Extraction Engine")
+        self.tabs.addTab(self._build_review_tab(), "Manual Review Panel")
 
-        row_out = QHBoxLayout(); self.output_edit = QLineEdit(placeholderText="Output destination...", readOnly=True)
-        btn_out = QPushButton("Browse Output"); btn_out.clicked.connect(self._browse_output)
-        row_out.addWidget(self.output_edit); row_out.addWidget(btn_out); left_panel.addLayout(row_out)
+    def _build_dashboard_tab(self) -> QWidget:
+        tab = QWidget()
+        dash = QHBoxLayout(tab)
+        dash.setSpacing(15)
 
+        # -- left panel --------------------------------------------------
+        left = QVBoxLayout()
+
+        row_in = QHBoxLayout()
+        self.input_edit = QLineEdit(placeholderText="Input folder...", readOnly=True)
+        btn_in = QPushButton("Browse Input")
+        btn_in.clicked.connect(self._browse_input)
+        row_in.addWidget(self.input_edit)
+        row_in.addWidget(btn_in)
+        left.addLayout(row_in)
+
+        row_out = QHBoxLayout()
+        self.output_edit = QLineEdit(
+            placeholderText="Output destination...", readOnly=True
+        )
+        btn_out = QPushButton("Browse Output")
+        btn_out.clicked.connect(self._browse_output)
+        row_out.addWidget(self.output_edit)
+        row_out.addWidget(btn_out)
+        left.addLayout(row_out)
+
+        left.addWidget(QLabel("Queries:"))
         self.query_edit = QTextEdit(placeholderText="Queries (one per line)...")
-        left_panel.addWidget(QLabel("Queries:"))
-        left_panel.addWidget(self.query_edit, stretch=1)
+        left.addWidget(self.query_edit, stretch=1)
 
         btn_import = QPushButton("Import Queries from .txt File")
         btn_import.clicked.connect(self._import_txt)
-        left_panel.addWidget(btn_import)
+        left.addWidget(btn_import)
 
         self.status_label = QLabel("Status: Ready")
         self.progress_bar = QProgressBar()
-        left_panel.addWidget(self.status_label); left_panel.addWidget(self.progress_bar)
+        left.addWidget(self.status_label)
+        left.addWidget(self.progress_bar)
 
         row_act = QHBoxLayout()
-        self.btn_run = QPushButton("Start Processing"); self.btn_run.clicked.connect(self._start)
-        self.btn_cancel = QPushButton("Cancel"); self.btn_cancel.setEnabled(False); self.btn_cancel.clicked.connect(self._cancel)
-        row_act.addWidget(self.btn_run); row_act.addWidget(self.btn_cancel); left_panel.addLayout(row_act)
+        self.btn_run = QPushButton("Start Processing")
+        self.btn_run.clicked.connect(self._start)
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self._cancel)
+        row_act.addWidget(self.btn_run)
+        row_act.addWidget(self.btn_cancel)
+        left.addLayout(row_act)
 
-        right_panel = QVBoxLayout()
-        self.result_table = QTableWidget(0, 2); self.result_table.setHorizontalHeaderLabels(["Query", "Hits"])
+        # -- right panel -------------------------------------------------
+        right = QVBoxLayout()
+        self.result_table = QTableWidget(0, 2)
+        self.result_table.setHorizontalHeaderLabels(["Query", "Hits"])
         self.result_table.horizontalHeader().setStretchLastSection(True)
-        right_panel.addWidget(QLabel("Metrics Overview"))
-        right_panel.addWidget(self.result_table)
+        right.addWidget(QLabel("Metrics Overview"))
+        right.addWidget(self.result_table)
 
-        dash_layout.addLayout(left_panel, stretch=4)
-        dash_layout.addWidget(QFrame())
-        dash_layout.addLayout(right_panel, stretch=5)
-        self.tabs.addTab(tab_dash, "Data Extraction Engine")
+        dash.addLayout(left, stretch=4)
+        dash.addLayout(right, stretch=5)
+        return tab
 
-        # TAB 2: MANUAL REVIEW SYSTEM
+    def _build_review_tab(self) -> QWidget:
         self.tab_review = QWidget()
-        review_layout = QHBoxLayout(self.tab_review)
-        
+        layout = QHBoxLayout(self.tab_review)
         splitter = QSplitter(Qt.Horizontal)
-        review_layout.addWidget(splitter)
+        layout.addWidget(splitter)
 
-        left_review_widget = QWidget()
-        left_review_layout = QVBoxLayout(left_review_widget)
-        
-        search_layout = QHBoxLayout()
-        search_layout.addWidget(QLabel("Filter Query:"))
-        self.search_bar = QLineEdit(placeholderText="Type query to filter tree panel...")
+        # -- left: tree panel --------------------------------------------
+        left_w = QWidget()
+        left_l = QVBoxLayout(left_w)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Filter Query:"))
+        self.search_bar = QLineEdit(
+            placeholderText="Type query to filter tree panel..."
+        )
         self.search_bar.textChanged.connect(self._rebuild_review_tree)
-        search_layout.addWidget(self.search_bar)
-        left_review_layout.addLayout(search_layout)
+        search_row.addWidget(self.search_bar)
+        left_l.addLayout(search_row)
 
-        tree_utility_row = QHBoxLayout()
-        btn_expand_all = QPushButton("Expand All"); btn_expand_all.clicked.connect(self.review_tree_expand)
-        btn_collapse_all = QPushButton("Collapse All"); btn_collapse_all.clicked.connect(self.review_tree_collapse)
-        tree_utility_row.addWidget(btn_expand_all)
-        tree_utility_row.addWidget(btn_collapse_all)
-        left_review_layout.addLayout(tree_utility_row)
+        tree_btn_row = QHBoxLayout()
+        btn_expand = QPushButton("Expand All")
+        btn_expand.clicked.connect(
+            self.review_tree.expandAll if hasattr(self, "review_tree") else lambda: None
+        )
+        btn_collapse = QPushButton("Collapse All")
+        btn_collapse.clicked.connect(
+            self.review_tree.collapseAll
+            if hasattr(self, "review_tree")
+            else lambda: None
+        )
+        tree_btn_row.addWidget(btn_expand)
+        tree_btn_row.addWidget(btn_collapse)
+        left_l.addLayout(tree_btn_row)
 
         self.review_tree = QTreeView()
         self.tree_model = QStandardItemModel()
-        self.tree_model.setHorizontalHeaderLabels(["Query Elements / Page Index Hierarchy"])
+        self.tree_model.setHorizontalHeaderLabels(
+            ["Query Elements / Page Index Hierarchy"]
+        )
         self.review_tree.setModel(self.tree_model)
-
-        # ExtendedSelection (not SingleSelection) keeps the highlight painted on
-        # the current row during keyboard navigation on all platform styles.
-        # SingleSelection can drop the visual highlight when the item changes.
         self.review_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-
-        # By default Qt only paints the hover highlight on actual mouse hover.
-        # Keyboard "current" gets a thin focus rect that is nearly invisible on
-        # most themes.  This stylesheet makes hover, selected, current-with-focus,
-        # and current-without-focus all render with the same vivid background so
-        # keyboard nav is exactly as visible as mouse nav.
         self.review_tree.setStyleSheet("""
-/* 1. Fix the main tree view to disable the focus outline globally */
-QTreeView {
-    outline: 0;
-}
-
-/* 2. Apply border resets to ALL item states to prevent standard borders from leaking in */
-QTreeView::item {
-    border: 0px solid transparent;
-}
-
-QTreeView::item:hover {
-    background: rgba(70, 130, 200, 0.45);
-    color: white;
-}
-
-QTreeView::item:selected {
-    background: rgba(70, 130, 200, 0.70);
-    color: white;
-}
-
-QTreeView::item:selected:!focus {
-    background: rgba(70, 130, 200, 0.50);
-    color: white;
-}
-
-QTreeView::item:focus {
-    background: rgba(70, 130, 200, 0.70);
-    color: white;
-    border: 0px solid transparent;
-}
+QTreeView                   { outline: 0; }
+QTreeView::item             { border: 0px solid transparent; }
+QTreeView::item:hover       { background: rgba(70,130,200,0.45); color: white; }
+QTreeView::item:selected    { background: rgba(70,130,200,0.70); color: white; }
+QTreeView::item:selected:!focus { background: rgba(70,130,200,0.50); color: white; }
+QTreeView::item:focus       { background: rgba(70,130,200,0.70); color: white;
+                               border: 0px solid transparent; }
         """)
-
-        # installEventFilter lets us intercept key events before Qt's internal
-        # selection machinery runs, ensuring _activate_index fires on every
-        # keyboard move regardless of what the selection model does internally.
         self.review_tree.installEventFilter(self)
-
-        # Two separate hooks — mouse clicks via clicked, keyboard nav via
-        # currentChanged — mirroring the working reference implementation.
-        # Both funnel into the same _activate_index handler.
         self.review_tree.clicked.connect(self._activate_index)
         self.review_tree.selectionModel().currentChanged.connect(
             lambda cur, _prev: self._activate_index(cur)
         )
-        
-        left_review_layout.addWidget(QLabel("Extracted Targets / Candidates Tree View"))
-        left_review_layout.addWidget(self.review_tree)
-        splitter.addWidget(left_review_widget)
 
-        right_review_widget = QWidget()
-        right_review_layout = QVBoxLayout(right_review_widget)
-        
-        row_ctrls = QHBoxLayout()
-        btn_z_in = QPushButton("Zoom In"); btn_z_in.clicked.connect(lambda: self._adjust_zoom(1.2))
-        btn_z_out = QPushButton("Zoom Out"); btn_z_out.clicked.connect(lambda: self._adjust_zoom(0.8))
-        btn_ccw = QPushButton("Rotate CCW"); btn_ccw.clicked.connect(lambda: self._rotate(-90))
-        btn_cw = QPushButton("Rotate CW"); btn_cw.clicked.connect(lambda: self._rotate(90))
-        self.btn_toggle_view = QPushButton("Switch to Text Layer View"); self.btn_toggle_view.clicked.connect(self._toggle_view_mode)
-        row_ctrls.addWidget(btn_z_in); row_ctrls.addWidget(btn_z_out); row_ctrls.addWidget(btn_ccw); row_ctrls.addWidget(btn_cw); row_ctrls.addWidget(self.btn_toggle_view)
-        right_review_layout.addLayout(row_ctrls)
+        # Wire the expand/collapse buttons now that self.review_tree exists
+        btn_expand.clicked.disconnect()
+        btn_collapse.clicked.disconnect()
+        btn_expand.clicked.connect(self.review_tree.expandAll)
+        btn_collapse.clicked.connect(self.review_tree.collapseAll)
 
-        self.gfx_view = QGraphicsView()
+        left_l.addWidget(QLabel("Extracted Targets / Candidates Tree View"))
+        left_l.addWidget(self.review_tree)
+        splitter.addWidget(left_w)
+
+        # -- right: preview + controls -----------------------------------
+        right_w = QWidget()
+        right_l = QVBoxLayout(right_w)
+
+        ctrl_row = QHBoxLayout()
+        for label, fn in [
+            ("Zoom In", lambda: self._adjust_zoom(1.2)),
+            ("Zoom Out", lambda: self._adjust_zoom(0.8)),
+            ("Rotate CCW", lambda: self._rotate(-90)),
+            ("Rotate CW", lambda: self._rotate(90)),
+        ]:
+            btn = QPushButton(label)
+            btn.clicked.connect(fn)
+            ctrl_row.addWidget(btn)
+
+        self.btn_toggle_view = QPushButton("Switch to Text Layer View")
+        self.btn_toggle_view.clicked.connect(self._toggle_view_mode)
+        ctrl_row.addWidget(self.btn_toggle_view)
+        right_l.addLayout(ctrl_row)
+
         self.gfx_scene = QGraphicsScene()
-        self.gfx_view.setScene(self.gfx_scene)
-        
+        self.gfx_view = QGraphicsView(self.gfx_scene)
         self.text_preview = QTextEdit()
         self.text_preview.setReadOnly(True)
         self.text_preview.hide()
-        
-        right_review_layout.addWidget(self.gfx_view, stretch=1)
-        right_review_layout.addWidget(self.text_preview, stretch=1)
+        right_l.addWidget(self.gfx_view, stretch=1)
+        right_l.addWidget(self.text_preview, stretch=1)
 
-        row_decision = QHBoxLayout()
-        self.btn_approve = QPushButton("Approve Candidate Page"); self.btn_approve.setStyleSheet("background-color:#27ae60;color:white;font-weight:bold;padding:6px;")
-        self.btn_reject = QPushButton("Reject / Extirpate Page"); self.btn_reject.setStyleSheet("background-color:#c0392b;color:white;font-weight:bold;padding:6px;")
+        dec_row = QHBoxLayout()
+        self.btn_approve = QPushButton("Approve Candidate Page")
+        self.btn_approve.setStyleSheet(
+            "background-color:#27ae60;color:white;font-weight:bold;padding:6px;"
+        )
+        self.btn_reject = QPushButton("Reject / Extirpate Page")
+        self.btn_reject.setStyleSheet(
+            "background-color:#c0392b;color:white;font-weight:bold;padding:6px;"
+        )
         self.btn_approve.clicked.connect(self._approve_current_item)
         self.btn_reject.clicked.connect(self._reject_current_item)
-        row_decision.addWidget(self.btn_approve); row_decision.addWidget(self.btn_reject)
-        right_review_layout.addLayout(row_decision)
+        dec_row.addWidget(self.btn_approve)
+        dec_row.addWidget(self.btn_reject)
+        right_l.addLayout(dec_row)
 
-        splitter.addWidget(right_review_widget)
+        splitter.addWidget(right_w)
         splitter.setSizes([400, 750])
-        self.tabs.addTab(self.tab_review, "Manual Review Panel")
+        return self.tab_review
 
-    def _browse_input(self):
+    # ------------------------------------------------------------------
+    # Directory / query helpers
+    # ------------------------------------------------------------------
+
+    def _browse_input(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Input")
-        if d: self.input_edit.setText(d)
+        if d:
+            self.input_edit.setText(d)
 
-    def _browse_output(self):
+    def _browse_output(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Output")
-        if d: self.output_edit.setText(d)
+        if d:
+            self.output_edit.setText(d)
 
     def _import_txt(self) -> None:
-        fp, _ = QFileDialog.getOpenFileName(self, "Open Query File", "", "Text Files (*.txt)")
-        if not fp: return
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "Open Query File", "", "Text Files (*.txt)"
+        )
+        if not fp:
+            return
         try:
             with open(fp, encoding="utf-8", errors="ignore") as fh:
-                lines = [ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("[")]
+                lines = [
+                    ln.strip()
+                    for ln in fh
+                    if ln.strip() and not ln.strip().startswith("[")
+                ]
             self.query_edit.setPlainText("\n".join(lines))
             QMessageBox.information(self, "Imported", f"Loaded {len(lines)} queries.")
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to read file:\n{exc}")
 
-    def review_tree_expand(self): self.review_tree.expandAll()
-    def review_tree_collapse(self): self.review_tree.collapseAll()
+    # ------------------------------------------------------------------
+    # Processing control
+    # ------------------------------------------------------------------
 
     def _start(self) -> None:
         input_dir = self.input_edit.text().strip()
         output_dir = self.output_edit.text().strip()
-        queries = [q.strip() for q in self.query_edit.toPlainText().split("\n") if q.strip()]
+        queries = [
+            q.strip() for q in self.query_edit.toPlainText().splitlines() if q.strip()
+        ]
 
         if not input_dir or not output_dir or not queries:
-            QMessageBox.warning(self, "Configuration Check", "Ensure directories and queries are defined completely.")
+            QMessageBox.warning(
+                self,
+                "Configuration Check",
+                "Ensure directories and queries are defined completely.",
+            )
             return
 
-        self.btn_run.setEnabled(False); self.btn_cancel.setEnabled(True)
+        self.btn_run.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
         self.progress_bar.setRange(0, 0)
+
         self._worker = ProcessingWorker(input_dir, queries, output_dir)
         self._worker.progress_signal.connect(self._on_progress)
         self._worker.finished_signal.connect(self._on_finished)
+        self._worker.error_signal.connect(self._on_error)
         self._worker.start()
 
-    def _cancel(self):
-        if self._worker: self._worker.cancel()
+    def _cancel(self) -> None:
+        if self._worker:
+            self._worker.cancel()
 
-    def _on_progress(self, current: int, total: int, msg: str):
-        if self.progress_bar.maximum() == 0: self.progress_bar.setRange(0, total)
+    def _on_progress(self, current: int, total: int, msg: str) -> None:
+        if self.progress_bar.maximum() == 0:
+            self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(current)
         self.status_label.setText(msg)
 
-    def _on_finished(self, counts: dict[str, int], review_data: list[dict]):
-        self.btn_run.setEnabled(True); self.btn_cancel.setEnabled(False)
-        self.progress_bar.setRange(0, 100); self.progress_bar.setValue(100)
-        self.status_label.setText("Batch run finished. Reports generated in destination output path.")
+    def _on_finished(self, counts: dict[str, int], review_data: list[dict]) -> None:
+        self.btn_run.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.status_label.setText(
+            "Batch run finished. Reports generated in destination output path."
+        )
+
         self.review_records = review_data
-        # Seed the live counts so approve/reject can delta against it
         self._live_counts = dict(counts)
-        
+
         self._refresh_metrics_table()
         self._rebuild_review_tree()
         self.tabs.setCurrentWidget(self.tab_review)
 
+    def _on_error(self, msg: str) -> None:
+        self.btn_run.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.status_label.setText(f"Error: {msg}")
+        QMessageBox.warning(self, "Processing Error", msg)
+
     # ------------------------------------------------------------------
-    # FIX 2: Centralised metrics refresh so the table, CSV, and DB all
-    # stay in sync whenever _live_counts is mutated by approve/reject.
+    # Metrics table  (majority-value highlighting)
     # ------------------------------------------------------------------
+
     def _refresh_metrics_table(self) -> None:
         counts = self._live_counts
         self.result_table.setRowCount(len(counts))
-        for idx, (q, c) in enumerate(sorted(counts.items(), key=lambda x: x[1])):
+
+        majority_value: int = 0
+        if counts:
+            frequency_map = Counter(counts.values())
+            majority_value = frequency_map.most_common(1)[0][0]
+
+        for idx, (q, c) in enumerate(sorted(counts.items())):
             self.result_table.setItem(idx, 0, QTableWidgetItem(q))
-            self.result_table.setItem(idx, 1, QTableWidgetItem(str(c)))
+
+            count_item = QTableWidgetItem(str(c))
+            if c != majority_value:
+                if c < majority_value:
+                    # Below majority → muted amber
+                    count_item.setBackground(QBrush(QColor("#f1c40f")))
+                else:
+                    # Above majority → muted coral/orange
+                    count_item.setBackground(QBrush(QColor("#e67e22")))
+                count_item.setForeground(QBrush(QColor("#000000")))
+
+            self.result_table.setItem(idx, 1, count_item)
+
+    # ------------------------------------------------------------------
+    # Persist metrics (CSV + SQLite) after every approve/reject action
+    # ------------------------------------------------------------------
 
     def _persist_metrics(self) -> None:
-        """Rewrite report.csv and update extraction_history.db to match _live_counts."""
         output_dir = self.output_edit.text().strip()
         if not output_dir:
             return
         out_path = Path(output_dir)
         try:
             out_path.mkdir(parents=True, exist_ok=True)
-            # CSV
-            csv_file = out_path / "report.csv"
-            with open(csv_file, "w", newline="", encoding="utf-8") as f:
+
+            with open(out_path / "report.csv", "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(["Query", "Total Approved Hits"])
-                for q, c in self._live_counts.items():
-                    writer.writerow([q, c])
-            # DB – update summary_metrics and candidates_log approval state
-            db_file = out_path / "extraction_history.db"
-            conn = sqlite3.connect(str(db_file))
+                writer.writerows(self._live_counts.items())
+
+            conn = sqlite3.connect(str(out_path / "extraction_history.db"))
             cursor = conn.cursor()
-            cursor.execute("CREATE TABLE IF NOT EXISTS summary_metrics (query TEXT PRIMARY KEY, hits INTEGER)")
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS summary_metrics (query TEXT PRIMARY KEY, hits INTEGER)"
+            )
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS candidates_log (
-                    id TEXT PRIMARY KEY, query TEXT, file_path TEXT, page_index INTEGER, pre_approved INTEGER
+                    id TEXT PRIMARY KEY, query TEXT, file_path TEXT,
+                    page_index INTEGER, pre_approved INTEGER
                 )
             """)
             cursor.executemany(
                 "INSERT OR REPLACE INTO summary_metrics VALUES (?,?)",
                 list(self._live_counts.items()),
             )
-            log_rows = [
-                (item["id"], item["query"], item["file_path"], item["page_idx"], 1 if item["pre_approved"] else 0)
-                for item in self.review_records
-            ]
-            cursor.executemany("INSERT OR REPLACE INTO candidates_log VALUES (?,?,?,?,?)", log_rows)
+            cursor.executemany(
+                "INSERT OR REPLACE INTO candidates_log VALUES (?,?,?,?,?)",
+                [
+                    (
+                        item["id"],
+                        item["query"],
+                        item["file_path"],
+                        item["page_idx"],
+                        1 if item["pre_approved"] else 0,
+                    )
+                    for item in self.review_records
+                ],
+            )
             conn.commit()
             conn.close()
-        except Exception as e:
-            log.error("Failed to persist metrics after review action: %s", e)
+        except Exception as exc:
+            log.error("Failed to persist metrics after review action: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Review tree
+    # ------------------------------------------------------------------
 
     def _rebuild_review_tree(self) -> None:
-        selected_id = self.current_review_item["id"] if self.current_review_item else None
-        
+        selected_id = (
+            self.current_review_item["id"] if self.current_review_item else None
+        )
+
         self.tree_model.clear()
         self.tree_model.setHorizontalHeaderLabels(["Query Target Layout Mapping Tree"])
-        
+
         search_filter = self.search_bar.text().strip().lower()
-        query_buckets = defaultdict(list)
+        query_buckets: dict[str, list[dict]] = defaultdict(list)
         for item in self.review_records:
             if search_filter and search_filter not in item["query"].lower():
                 continue
             query_buckets[item["query"]].append(item)
 
-        target_node_to_select = None
+        target_node: QStandardItem | None = None
 
         for query, items in query_buckets.items():
             query_node = QStandardItem(query)
             query_node.setSelectable(False)
             self.tree_model.appendRow(query_node)
 
-            sorted_items = sorted(items, key=lambda x: len(x["missing_words"]))
-
-            for item in sorted_items:
-                p_name = Path(item["file_path"]).name
+            for item in sorted(items, key=lambda x: len(x["missing_words"])):
                 page_node = QStandardItem()
-                
+                p_name = Path(item["file_path"]).name
+
                 if item["pre_approved"]:
-                    page_node.setText(f"Page {item['page_idx'] + 1} -> {p_name} [APPROVED]")
+                    page_node.setText(
+                        f"Page {item['page_idx'] + 1} -> {p_name} [APPROVED]"
+                    )
                     page_node.setForeground(QBrush(QColor("#27ae60")))
                 else:
-                    page_node.setText(f"Page {item['page_idx'] + 1} -> {p_name} [CANDIDATE] (Missing: {', '.join(item['missing_words'])})")
-                    page_node.setToolTip(f"Missing terms: {', '.join(item['missing_words'])}")
+                    missing = ", ".join(item["missing_words"])
+                    page_node.setText(
+                        f"Page {item['page_idx'] + 1} -> {p_name} [CANDIDATE] (Missing: {missing})"
+                    )
+                    page_node.setToolTip(f"Missing terms: {missing}")
                     page_node.setForeground(QBrush(QColor("#d35400")))
-                
+
                 page_node.setData(item, Qt.UserRole)
                 query_node.appendRow(page_node)
-                
+
                 if selected_id and item["id"] == selected_id:
-                    target_node_to_select = page_node
-        
+                    target_node = page_node
+
         self.review_tree.expandAll()
 
-        # tree_model.clear() replaces the underlying QItemSelectionModel, which
-        # orphans any connection made at init time.  Reconnect both signals on
-        # the fresh selection model so keyboard and mouse both stay live.
+        # tree_model.clear() replaces the underlying QItemSelectionModel;
+        # reconnect so keyboard and mouse nav both stay live.
         self.review_tree.selectionModel().currentChanged.connect(
             lambda cur, _prev: self._activate_index(cur)
         )
 
-        if target_node_to_select:
-            idx = self.tree_model.indexFromItem(target_node_to_select)
-            self.review_tree.selectionModel().setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        if target_node is not None:
+            idx = self.tree_model.indexFromItem(target_node)
+            self.review_tree.selectionModel().setCurrentIndex(
+                idx, QItemSelectionModel.SelectionFlag.ClearAndSelect
+            )
 
     def _activate_index(self, index: QModelIndex) -> None:
         node = self.tree_model.itemFromIndex(index)
-        if not node: return
+        if not node:
+            return
         item_data = node.data(Qt.UserRole)
-        if not item_data: return
-
+        if not item_data:
+            return
         self.current_review_item = item_data
         self._render_selected_element()
 
-    def eventFilter(self, obj, event) -> bool:
-        """Intercept key presses on the tree so currentChanged fires before Qt
-        can interfere with the visual selection state."""
+    def eventFilter(self, obj: object, event: QEvent) -> bool:
         if obj is self.review_tree and event.type() == QEvent.KeyPress:
             key = event.key()
-            if key in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right,
-                       Qt.Key_PageUp, Qt.Key_PageDown, Qt.Key_Home, Qt.Key_End):
-                # Let Qt move current normally, then manually activate whatever
-                # landed on.  We call the base class first so the tree moves,
-                # then read back currentIndex().
+            if key in (
+                Qt.Key_Up,
+                Qt.Key_Down,
+                Qt.Key_Left,
+                Qt.Key_Right,
+                Qt.Key_PageUp,
+                Qt.Key_PageDown,
+                Qt.Key_Home,
+                Qt.Key_End,
+            ):
                 result = super().eventFilter(obj, event)
                 self._activate_index(self.review_tree.currentIndex())
                 return result
         return super().eventFilter(obj, event)
 
+    # ------------------------------------------------------------------
+    # Page preview rendering
+    # ------------------------------------------------------------------
+
     def _render_selected_element(self) -> None:
-        if not self.current_review_item: return
+        if not self.current_review_item:
+            return
         item = self.current_review_item
 
         if self.view_text_mode:
             self.gfx_view.hide()
             self.text_preview.show()
-            
-            raw_text = item["text_content"]
-            if not raw_text.strip():
-                self.text_preview.setPlainText("[No text layer parsed inside cache storage framework]")
-                return
-
-            tokens = [w.strip() for w in item["query"].split() if len(w.strip()) > 1]
-            html_text = raw_text
-            html_text = html_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            
-            for token in tokens:
-                if token:
-                    pattern = re.compile(re.escape(token), re.IGNORECASE)
-                    html_text = pattern.sub(lambda m: f'<span style="background-color: #ffff00; color: #000000; font-weight: bold;">{m.group(0)}</span>', html_text)
-            
-            html_text = html_text.replace("\n", "<br>")
-            self.text_preview.setHtml(f"<div style='font-family: monospace; font-size: 12px;'>{html_text}</div>")
+            self._render_text_view(item)
         else:
             self.text_preview.hide()
             self.gfx_view.show()
-            self.gfx_scene.clear()
+            self._render_graphics_view(item)
 
-            f_path = item["file_path"]
-            is_pdf = Path(f_path).suffix.lower() == ".pdf"
-            q_pixmap = None
+    def _render_text_view(self, item: dict) -> None:
+        raw_text = item["text_content"]
+        if not raw_text.strip():
+            self.text_preview.setPlainText("[No text layer found]")
+            return
 
-            try:
-                if is_pdf:
-                    doc = fitz.open(_unc(f_path))
-                    page = doc[item["page_idx"]]
-                    pix = page.get_pixmap(dpi=150)
-                    q_img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
-                    q_pixmap = QPixmap.fromImage(q_img)
-                    doc.close()
-                else:
-                    with Image.open(f_path) as img:
-                        img_corr = ImageOps.exif_transpose(img).convert("RGB")
-                        byte_arr = io.BytesIO()
-                        img_corr.save(byte_arr, format='PNG')
-                        q_pixmap = QPixmap()
-                        q_pixmap.loadFromData(byte_arr.getvalue(), 'PNG')
-            except Exception as e:
-                log.error("Failed structural draw view pass: %s", e)
-                return
+        tokens = [w.strip() for w in item["query"].split() if len(w.strip()) > 1]
+        html_text = (
+            raw_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )
 
-            if q_pixmap and not q_pixmap.isNull():
-                pix_item = self.gfx_scene.addPixmap(q_pixmap)
-                self.gfx_scene.setSceneRect(pix_item.boundingRect())
-                self._apply_transformations()
-                self.gfx_view.fitInView(pix_item, Qt.KeepAspectRatio)
+        for token in tokens:
+            pattern = re.compile(re.escape(token), re.IGNORECASE)
+            html_text = pattern.sub(
+                lambda m: (
+                    f'<span style="background-color:#ffff00;color:#000000;font-weight:bold;">'
+                    f"{m.group(0)}</span>"
+                ),
+                html_text,
+            )
+
+        html_text = html_text.replace("\n", "<br>")
+        self.text_preview.setHtml(
+            f"<div style='font-family:monospace;font-size:12px;'>{html_text}</div>"
+        )
+
+    def _render_graphics_view(self, item: dict) -> None:
+        self.gfx_scene.clear()
+        f_path = item["file_path"]
+        is_pdf = Path(f_path).suffix.lower() == ".pdf"
+        q_pixmap: QPixmap | None = None
+
+        try:
+            if is_pdf:
+                doc = fitz.open(_unc(f_path))
+                page = doc[item["page_idx"]]
+                pix = page.get_pixmap(dpi=150)
+                q_img = QImage(
+                    pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888
+                )
+                q_pixmap = QPixmap.fromImage(q_img)
+                doc.close()
+            else:
+                with Image.open(f_path) as img:
+                    img_corr = ImageOps.exif_transpose(img).convert("RGB")
+                    buf = io.BytesIO()
+                    img_corr.save(buf, format="PNG")
+                    q_pixmap = QPixmap()
+                    q_pixmap.loadFromData(buf.getvalue(), "PNG")
+        except Exception as exc:
+            log.error("Failed to render page preview: %s", exc)
+            return
+
+        if q_pixmap and not q_pixmap.isNull():
+            pix_item = self.gfx_scene.addPixmap(q_pixmap)
+            self.gfx_scene.setSceneRect(pix_item.boundingRect())
+            self._apply_transformations()
+            self.gfx_view.fitInView(pix_item, Qt.KeepAspectRatio)
 
     def _apply_transformations(self) -> None:
-        trans = QTransform()
-        trans.scale(self.zoom_factor, self.zoom_factor)
-        trans.rotate(self.current_rotation)
-        self.gfx_view.setTransform(trans)
+        t = QTransform()
+        t.scale(self.zoom_factor, self.zoom_factor)
+        t.rotate(self.current_rotation)
+        self.gfx_view.setTransform(t)
 
     def _adjust_zoom(self, factor: float) -> None:
         self.zoom_factor *= factor
@@ -863,95 +1129,121 @@ QTreeView::item:focus {
 
     def _toggle_view_mode(self) -> None:
         self.view_text_mode = not self.view_text_mode
-        self.btn_toggle_view.setText("Switch to Graphics Image View" if self.view_text_mode else "Switch to Text Layer View")
+        self.btn_toggle_view.setText(
+            "Switch to Graphics Image View"
+            if self.view_text_mode
+            else "Switch to Text Layer View"
+        )
         self._render_selected_element()
 
+    # ------------------------------------------------------------------
+    # Approve / Reject actions
+    # ------------------------------------------------------------------
+
     def _approve_current_item(self) -> None:
-        if not self.current_review_item: return
+        if not self.current_review_item:
+            return
         item = self.current_review_item
-        
-        if not item["pre_approved"]:
-            try:
-                folder = Path(self.output_edit.text().strip()) / safe_folder_name(item["query"])
-                folder.mkdir(parents=True, exist_ok=True)
-                p_obj = Path(item["file_path"])
-                
-                if p_obj.suffix.lower() == ".pdf":
-                    doc = fitz.open(_unc(item["file_path"]))
-                    out_doc = fitz.open()
-                    out_doc.insert_pdf(doc, from_page=item["page_idx"], to_page=item["page_idx"])
-                    out_doc.save(_unc(str(folder / f"{p_obj.stem}_approved_{item['file_hash']}.pdf")), garbage=4, deflate=True)
-                    out_doc.close(); doc.close()
-                else:
-                    import shutil
-                    shutil.copy2(item["file_path"], folder / f"{p_obj.stem}_approved_{item['file_hash']}{p_obj.suffix}")
-                    
-                item["pre_approved"] = True
+        if item["pre_approved"]:
+            return
 
-                # FIX 2: bump live count and sync all downstream targets
-                self._live_counts[item["query"]] = self._live_counts.get(item["query"], 0) + 1
-                self._refresh_metrics_table()
-                self._persist_metrics()
+        try:
+            folder = Path(self.output_edit.text().strip()) / safe_folder_name(
+                item["query"]
+            )
+            folder.mkdir(parents=True, exist_ok=True)
+            p_obj = Path(item["file_path"])
 
-                # In-place style update — keep focus on this node
-                current_index = self.review_tree.selectionModel().currentIndex()
-                if current_index.isValid():
-                    node = self.tree_model.itemFromIndex(current_index)
-                    if node:
-                        p_name = Path(item["file_path"]).name
-                        node.setText(f"Page {item['page_idx'] + 1} -> {p_name} [APPROVED]")
-                        node.setForeground(QBrush(QColor("#27ae60")))
-                        node.setData(item, Qt.UserRole)
-                        
-            except Exception as e:
-                QMessageBox.critical(self, "I/O Error", f"Failed manual export sequence: {e}")
+            if p_obj.suffix.lower() == ".pdf":
+                doc = fitz.open(_unc(item["file_path"]))
+                out_doc = fitz.open()
+                out_doc.insert_pdf(
+                    doc, from_page=item["page_idx"], to_page=item["page_idx"]
+                )
+                out_doc.save(
+                    _unc(
+                        str(folder / f"{p_obj.stem}_approved_{item['file_hash']}.pdf")
+                    ),
+                    garbage=4,
+                    deflate=True,
+                )
+                out_doc.close()
+                doc.close()
+            else:
+                shutil.copy2(
+                    item["file_path"],
+                    folder / f"{p_obj.stem}_approved_{item['file_hash']}{p_obj.suffix}",
+                )
+
+            item["pre_approved"] = True
+            self._live_counts[item["query"]] = (
+                self._live_counts.get(item["query"], 0) + 1
+            )
+            self._refresh_metrics_table()
+            self._persist_metrics()
+            self._update_tree_node_style(item)
+
+        except Exception as exc:
+            QMessageBox.critical(self, "I/O Error", f"Failed manual export: {exc}")
 
     def _reject_current_item(self) -> None:
-        if not self.current_review_item: return
+        if not self.current_review_item:
+            return
         item = self.current_review_item
-        
+        if not item["pre_approved"]:
+            return
+
+        try:
+            folder = Path(self.output_edit.text().strip()) / safe_folder_name(
+                item["query"]
+            )
+            p_obj = Path(item["file_path"])
+            ext = ".pdf" if p_obj.suffix.lower() == ".pdf" else p_obj.suffix
+
+            # Both batch-run (stem_hash) and manual-approve (stem_approved_hash) variants
+            for candidate in [
+                folder / f"{p_obj.stem}_{item['file_hash']}{ext}",
+                folder / f"{p_obj.stem}_approved_{item['file_hash']}{ext}",
+            ]:
+                if candidate.exists():
+                    candidate.unlink()
+
+            item["pre_approved"] = False
+            self._live_counts[item["query"]] = max(
+                0, self._live_counts.get(item["query"], 1) - 1
+            )
+            self._refresh_metrics_table()
+            self._persist_metrics()
+            self._update_tree_node_style(item)
+
+        except Exception as exc:
+            QMessageBox.critical(self, "I/O Error", f"Failed cleanup: {exc}")
+
+    def _update_tree_node_style(self, item: dict) -> None:
+        """Refresh the label and colour of the currently-selected tree node in-place."""
+        current_index = self.review_tree.selectionModel().currentIndex()
+        if not current_index.isValid():
+            return
+        node = self.tree_model.itemFromIndex(current_index)
+        if not node:
+            return
+        p_name = Path(item["file_path"]).name
         if item["pre_approved"]:
-            try:
-                folder = Path(self.output_edit.text().strip()) / safe_folder_name(item["query"])
-                p_obj = Path(item["file_path"])
-                is_pdf = p_obj.suffix.lower() == ".pdf"
-                ext = p_obj.suffix if not is_pdf else ".pdf"
+            node.setText(f"Page {item['page_idx'] + 1} -> {p_name} [APPROVED]")
+            node.setForeground(QBrush(QColor("#27ae60")))
+        else:
+            missing = ", ".join(item["missing_words"])
+            node.setText(
+                f"Page {item['page_idx'] + 1} -> {p_name} [CANDIDATE] (Missing: {missing})"
+            )
+            node.setForeground(QBrush(QColor("#d35400")))
+        node.setData(item, Qt.UserRole)
 
-                # FIX 3: check all filename variants that could exist in the
-                # output folder — batch-run uses stem_hash, manual approve uses
-                # stem_approved_hash.  Delete whichever one is present.
-                candidates = [
-                    folder / f"{p_obj.stem}_{item['file_hash']}{ext}",
-                    folder / f"{p_obj.stem}_approved_{item['file_hash']}{ext}",
-                ]
-                deleted_any = False
-                for target_path in candidates:
-                    if target_path.exists():
-                        target_path.unlink()
-                        deleted_any = True
 
-                if not deleted_any:
-                    log.warning("Reject: no output file found to delete for item %s", item["id"])
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-                item["pre_approved"] = False
-
-                # FIX 2: decrement live count (floor at 0) and sync all targets
-                self._live_counts[item["query"]] = max(0, self._live_counts.get(item["query"], 1) - 1)
-                self._refresh_metrics_table()
-                self._persist_metrics()
-
-                # In-place style update — keep focus on this node
-                current_index = self.review_tree.selectionModel().currentIndex()
-                if current_index.isValid():
-                    node = self.tree_model.itemFromIndex(current_index)
-                    if node:
-                        p_name = Path(item["file_path"]).name
-                        node.setText(f"Page {item['page_idx'] + 1} -> {p_name} [CANDIDATE] (Missing: {', '.join(item['missing_words'])})")
-                        node.setForeground(QBrush(QColor("#d35400")))
-                        node.setData(item, Qt.UserRole)
-                        
-            except Exception as e:
-                QMessageBox.critical(self, "I/O Error", f"Failed cleanup sequence: {e}")
 
 def main() -> None:
     multiprocessing.freeze_support()
@@ -960,6 +1252,7 @@ def main() -> None:
     window = ExtractorApp()
     window.showNormal()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()

@@ -37,11 +37,11 @@ def get_face_bbox(img: Image.Image) -> tuple[int, int, int, int] | None:
     Returns (x0, y0, x1, y1) in PIL format (left, top, right, bottom).
     """
     img_width, img_height = img.size
-    
+
     # Crop the image to only the left half
     left_half_width = int(img_width * 0.5)
     left_half = img.crop((0, 0, left_half_width, img_height))
-    
+
     img_np = np.array(left_half.convert("RGB"))
 
     try:
@@ -63,7 +63,7 @@ def get_face_bbox(img: Image.Image) -> tuple[int, int, int, int] | None:
         area = largest_face_data["facial_area"]
         x, y, w, h = area["x"], area["y"], area["w"], area["h"]
 
-        # Because we sliced from the top-left (0,0), these coordinates 
+        # Because we sliced from the top-left (0,0), these coordinates
         # are exactly the same on the original image!
         return (x, y, x + w, y + h)
 
@@ -128,19 +128,19 @@ def calculate_3_4_crop(
 
 def crop_face_portrait_and_save(input_path: Path, output_path: Path):
     """
-    Opens an image, applies EXIF rotation, finds the face bounding box, 
+    Opens an image, applies EXIF rotation, finds the face bounding box,
     calculates a 3:4 crop centered on the face, and saves it.
     """
     try:
         # 1. Open the image
         img = Image.open(input_path)
-        
+
         # 2. Fix the EXIF rotation issue before doing anything else!
         img = ImageOps.exif_transpose(img)
-        
+
         # 3. Convert to RGB for DeepFace
         img = img.convert("RGB")
-        
+
         img_width, img_height = img.size
 
         face_bbox = get_face_bbox(img)
