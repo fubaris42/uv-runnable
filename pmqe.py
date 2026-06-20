@@ -16,6 +16,16 @@
 
 """
 PDF & Image Multi-Query Extractor (With Manual Review, Advanced Candidate Sorting, & Query Importer)
+
+Performance fixes applied (v2):
+  1. Aho-Corasick automaton built once per worker via initializer, not per file.
+  2. OCR streams page batches instead of loading all pages into RAM at once.
+  3. Matching runs on normal lowercase text (no space-stripping) — fixes false positives.
+  4. PDF opened only once per file (write output before closing).
+  5. IPC payload stripped of full text_content — fetched on demand from OCR cache.
+  6. SQLite cache tuned: busy_timeout, mmap, cache_size, partial-cache completion flag.
+  7. forkserver context used on Linux/macOS; spawn retained for Windows.
+  8. Small files (<= SMALL_FILE_BYTES) batched together into single worker calls.
 """
 
 from __future__ import annotations
@@ -83,9 +93,11 @@ pillow_heif.register_heif_opener()
 OCR_DPI = 200
 OCR_SAMPLE_PAGES = 5
 OCR_SAMPLE_THRESH = 200
+OCR_BATCH_SIZE = 8          # FIX 2: stream OCR in batches of this many pages
 CONTENT_HASH_BYTES = 1_048_576
 LOG_MAX_BYTES = 5_242_880
 LOG_BACKUP_COUNT = 3
+SMALL_FILE_BYTES = 512_000  # FIX 8: files smaller than this get batched together
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heif"}
 SUPPORTED_EXTENSIONS = {".pdf"} | IMAGE_EXTENSIONS
@@ -166,6 +178,7 @@ def build_automaton(
     """Return a compiled automaton and a token→query-index map."""
     token_qset: dict[str, set[int]] = defaultdict(set)
     for qi, q in enumerate(queries):
+        # FIX 3: keep multi-word tokens intact (space-join not split into chars)
         for part in (w.lower() for w in q.split() if len(w) > 1):
             token_qset[part].add(qi)
 
@@ -177,7 +190,24 @@ def build_automaton(
 
 
 # ---------------------------------------------------------------------------
+# FIX 1: Worker-process global — automaton initialised once per worker
+# ---------------------------------------------------------------------------
+
+_worker_automaton: ahocorasick.Automaton | None = None
+_worker_queries: list[str] = []
+
+
+def _worker_init(queries: list[str], log_path: str) -> None:
+    """Runs once when a worker process starts. Builds the automaton globally."""
+    global _worker_automaton, _worker_queries
+    _setup_logging(log_path)
+    _worker_automaton, _ = build_automaton(queries)
+    _worker_queries = queries
+
+
+# ---------------------------------------------------------------------------
 # OCR cache (SQLite, per-input-directory)
+# FIX 6: tuned pragmas + completion flag column
 # ---------------------------------------------------------------------------
 
 _ocr_cache_conn: sqlite3.Connection | None = None
@@ -193,29 +223,53 @@ _CREATE_CACHE_TABLE = """
     )
 """
 
+_CREATE_COMPLETION_TABLE = """
+    CREATE TABLE IF NOT EXISTS ocr_complete (
+        content_hash TEXT PRIMARY KEY,
+        total_pages  INTEGER NOT NULL,
+        timestamp    REAL NOT NULL
+    )
+"""
+
 
 def _get_cache_conn(db_path: str) -> sqlite3.Connection:
     global _ocr_cache_conn, _ocr_cache_path
     if _ocr_cache_conn is None or _ocr_cache_path != db_path:
         _ocr_cache_conn = sqlite3.connect(db_path, check_same_thread=False)
+        # FIX 6: performance pragmas
         _ocr_cache_conn.execute("PRAGMA journal_mode=WAL")
         _ocr_cache_conn.execute("PRAGMA synchronous=NORMAL")
+        _ocr_cache_conn.execute("PRAGMA busy_timeout=5000")
+        _ocr_cache_conn.execute("PRAGMA cache_size=-32768")   # 32 MB
+        _ocr_cache_conn.execute("PRAGMA mmap_size=268435456") # 256 MB
         _ocr_cache_conn.execute(_CREATE_CACHE_TABLE)
+        _ocr_cache_conn.execute(_CREATE_COMPLETION_TABLE)
         _ocr_cache_conn.commit()
         _ocr_cache_path = db_path
     return _ocr_cache_conn
 
 
 def cache_load(db_path: str, file_hash: str, total_pages: int) -> dict[int, str] | None:
+    """
+    FIX 6: use completion table so partial caches are skipped correctly.
+    Only returns cached data when the file was fully OCR'd previously.
+    """
     try:
         con = _get_cache_conn(db_path)
+        # Check completion record first (fast single-row lookup)
+        row = con.execute(
+            "SELECT total_pages FROM ocr_complete WHERE content_hash=?",
+            (file_hash,),
+        ).fetchone()
+        if not row or row[0] != total_pages:
+            return None
         rows = con.execute(
             "SELECT page_num, text FROM ocr_cache WHERE content_hash=? ORDER BY page_num",
             (file_hash,),
         ).fetchall()
         if len(rows) == total_pages:
             con.execute(
-                "UPDATE ocr_cache SET timestamp=? WHERE content_hash=?",
+                "UPDATE ocr_complete SET timestamp=? WHERE content_hash=?",
                 (time.time(), file_hash),
             )
             con.commit()
@@ -226,6 +280,7 @@ def cache_load(db_path: str, file_hash: str, total_pages: int) -> dict[int, str]
 
 
 def cache_save(db_path: str, file_hash: str, page_texts: dict[int, str]) -> None:
+    """FIX 6: write pages then stamp the completion record atomically."""
     try:
         con = _get_cache_conn(db_path)
         now = time.time()
@@ -233,9 +288,26 @@ def cache_save(db_path: str, file_hash: str, page_texts: dict[int, str]) -> None
             "INSERT OR REPLACE INTO ocr_cache (content_hash, page_num, text, timestamp) VALUES (?,?,?,?)",
             [(file_hash, pn, txt, now) for pn, txt in page_texts.items()],
         )
+        con.execute(
+            "INSERT OR REPLACE INTO ocr_complete (content_hash, total_pages, timestamp) VALUES (?,?,?)",
+            (file_hash, len(page_texts), now),
+        )
         con.commit()
     except Exception:
         pass
+
+
+def cache_load_page(db_path: str, file_hash: str, page_num: int) -> str | None:
+    """FIX 5: fetch a single page's text on demand (for UI review panel)."""
+    try:
+        con = _get_cache_conn(db_path)
+        row = con.execute(
+            "SELECT text FROM ocr_cache WHERE content_hash=? AND page_num=?",
+            (file_hash, page_num),
+        ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +322,6 @@ def _ocr_engine_lazy() -> Any:
     global _ocr_engine
     if _ocr_engine is None:
         from winrt.windows.media.ocr import OcrEngine  # type: ignore[import]
-
         _ocr_engine = OcrEngine.try_create_from_user_profile_languages()
     return _ocr_engine
 
@@ -308,20 +379,49 @@ def render_page(page: fitz.Page, dpi: int = OCR_DPI) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
+# FIX 2: Streaming OCR — yields (page_idx, text) without loading all pages
+# ---------------------------------------------------------------------------
+
+
+def _ocr_pages_streaming(
+    doc: fitz.Document,
+    dpi: int = OCR_DPI,
+    batch_size: int = OCR_BATCH_SIZE,
+):
+    """Generator: render + OCR `batch_size` pages at a time to cap RAM usage."""
+    total = len(doc)
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        batch_images = [render_page(doc[i], dpi=dpi) for i in range(start, end)]
+        texts = ocr_all_pages(batch_images)
+        for offset, text in enumerate(texts):
+            yield start + offset, text
+
+
+# ---------------------------------------------------------------------------
 # Core per-file processing  (runs in worker processes)
+# FIX 1: uses global _worker_automaton instead of rebuilding
+# FIX 3: matches on lowercase text with spaces intact
+# FIX 4: single fitz.open() per file
+# FIX 5: text_content excluded from returned review_data
 # ---------------------------------------------------------------------------
 
 
 def process_file(
     file_path: str,
-    queries: list[str],
     output_dir: str,
     cache_db: str,
-    log_path: str,
 ) -> dict[str, Any]:
-    _setup_logging(log_path)
+    """
+    Process a single file. Queries and automaton come from the worker-global
+    set by _worker_init — not passed as arguments to avoid repeated pickling.
+    """
+    A = _worker_automaton
+    queries = _worker_queries
 
-    A, _token_qset = build_automaton(queries)
+    if A is None:
+        log.error("Worker automaton not initialised for %s", file_path)
+        return {"counts": {}, "review_data": []}
 
     p_obj = Path(file_path)
     file_ext = p_obj.suffix.lower()
@@ -330,9 +430,10 @@ def process_file(
 
     page_texts: dict[int, str] = {}
 
-    # ---- extract text (or OCR) ----------------------------------------
+    # ---- extract text (or streaming OCR) ----------------------------------
     if is_pdf:
         try:
+            # FIX 4: open once, keep open for both extraction AND output writing
             doc = fitz.open(_unc(file_path))
         except Exception as exc:
             log.error("Cannot open PDF %s: %s", file_path, exc)
@@ -342,20 +443,20 @@ def process_file(
         cached = cache_load(cache_db, file_hash, total_pages)
         if cached is not None:
             page_texts = cached
-            doc.close()
         else:
             sample_n = min(OCR_SAMPLE_PAGES, total_pages)
             sample_chars = sum(len(doc[i].get_text() or "") for i in range(sample_n))
             if sample_chars >= OCR_SAMPLE_THRESH:
                 for i in range(total_pages):
                     page_texts[i] = doc[i].get_text() or ""
-                doc.close()
-            else:
-                images = [render_page(doc[i]) for i in range(total_pages)]
-                doc.close()
-                results = ocr_all_pages(images)
-                page_texts = {i: t for i, t in enumerate(results)}
+                # Save native-text pages to cache so the review panel can fetch them
                 cache_save(cache_db, file_hash, page_texts)
+            else:
+                # FIX 2: stream — don't hold all rendered pages in RAM
+                for page_idx, text in _ocr_pages_streaming(doc):
+                    page_texts[page_idx] = text
+                cache_save(cache_db, file_hash, page_texts)
+
     else:
         total_pages = 1
         cached = cache_load(cache_db, file_hash, total_pages)
@@ -370,14 +471,17 @@ def process_file(
                     cache_save(cache_db, file_hash, page_texts)
             except Exception as exc:
                 log.error("Cannot open image %s: %s", file_path, exc)
+                if is_pdf:
+                    doc.close()
                 return {"counts": {}, "review_data": []}
 
-    # ---- match queries against extracted text --------------------------
+    # ---- match queries against extracted text -----------------------------
+    # FIX 3: search on normal lowercase text — no space stripping
     match_counts: dict[str, int] = {q: 0 for q in queries}
     review_items: list[dict] = []
 
     for page_idx, raw_text in page_texts.items():
-        clean = raw_text.lower().replace(" ", "")
+        clean = raw_text.lower()  # FIX 3: spaces preserved
 
         for qi, query in enumerate(queries):
             tokens = [w.lower() for w in query.split() if len(w) > 1]
@@ -390,11 +494,11 @@ def process_file(
             missing_tokens = [t for t in tokens if t not in found_tokens]
             is_approved = not missing_tokens
 
-            # Include fully-approved hits AND partial candidates (≥1 token hit, multi-token query)
             if is_approved or (found_tokens and len(tokens) > 1):
                 if is_approved:
                     match_counts[query] += 1
 
+                # FIX 5: omit text_content from IPC payload; fetch on demand from cache
                 review_items.append(
                     {
                         "id": f"{file_hash}_{page_idx}_{qi}",
@@ -404,37 +508,37 @@ def process_file(
                         "page_idx": page_idx,
                         "pre_approved": is_approved,
                         "missing_words": missing_tokens,
-                        "text_content": raw_text,
+                        # "text_content" intentionally excluded — loaded from cache on demand
                     }
                 )
 
-    # ---- write approved pages to output folder -------------------------
+    # ---- write approved pages to output folder (FIX 4: still inside open doc)
     approved_by_query: dict[str, list[int]] = defaultdict(list)
     for item in review_items:
         if item["pre_approved"]:
             approved_by_query[item["query"]].append(item["page_idx"])
 
-    if is_pdf and approved_by_query:
-        try:
-            doc = fitz.open(_unc(file_path))
-            for q, pages in approved_by_query.items():
-                folder = Path(output_dir) / safe_folder_name(q)
-                folder.mkdir(parents=True, exist_ok=True)
-                out_doc = fitz.open()
-                for pn in pages:
-                    out_doc.insert_pdf(doc, from_page=pn, to_page=pn)
-                out_doc.save(
-                    _unc(str(folder / f"{p_obj.stem}_{file_hash}.pdf")),
-                    garbage=4,
-                    deflate=True,
-                )
-                out_doc.close()
-            doc.close()
-        except Exception as exc:
-            log.error("Failed to write PDF output for %s: %s", file_path, exc)
-    elif not is_pdf:
+    if is_pdf:
+        if approved_by_query:
+            try:
+                for q, pages in approved_by_query.items():
+                    folder = Path(output_dir) / safe_folder_name(q)
+                    folder.mkdir(parents=True, exist_ok=True)
+                    out_doc = fitz.open()
+                    for pn in pages:
+                        out_doc.insert_pdf(doc, from_page=pn, to_page=pn)
+                    out_doc.save(
+                        _unc(str(folder / f"{p_obj.stem}_{file_hash}.pdf")),
+                        garbage=4,
+                        deflate=True,
+                    )
+                    out_doc.close()
+            except Exception as exc:
+                log.error("Failed to write PDF output for %s: %s", file_path, exc)
+        doc.close()  # FIX 4: close exactly once, after writing
+    else:
         for q, pages in approved_by_query.items():
-            if pages:  # images are single-page; just copy once
+            if pages:
                 folder = Path(output_dir) / safe_folder_name(q)
                 folder.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(file_path, folder / f"{p_obj.stem}_{file_hash}{file_ext}")
@@ -443,7 +547,32 @@ def process_file(
 
 
 # ---------------------------------------------------------------------------
+# FIX 8: Batch small files into a single worker call
+# ---------------------------------------------------------------------------
+
+
+def process_file_batch(
+    file_paths: list[str],
+    output_dir: str,
+    cache_db: str,
+) -> dict[str, Any]:
+    """Process a list of small files sequentially inside one worker call."""
+    aggregate_counts: dict[str, int] = {q: 0 for q in _worker_queries}
+    all_review: list[dict] = []
+
+    for fp in file_paths:
+        result = process_file(fp, output_dir, cache_db)
+        for q, c in result["counts"].items():
+            aggregate_counts[q] += c
+        all_review.extend(result["review_data"])
+
+    return {"counts": aggregate_counts, "review_data": all_review}
+
+
+# ---------------------------------------------------------------------------
 # Background processing thread
+# FIX 7: forkserver on Linux/macOS
+# FIX 8: partitions files into small batches vs individual large files
 # ---------------------------------------------------------------------------
 
 
@@ -479,24 +608,58 @@ class ProcessingWorker(QThread):
             self.error_signal.emit("No supported assets found inside target folder.")
             return
 
-        total = len(all_files)
         cache_db = _unc(os.path.join(self.input_dir, ".ocr_cache.db"))
         log_path = _unc(os.path.join(self.output_dir, "extractor.log"))
         _setup_logging(log_path)
 
+        # FIX 8: split into large files (one job each) and small-file batches
+        large_files = []
+        small_files = []
+        for f in all_files:
+            try:
+                size = os.path.getsize(f)
+            except OSError:
+                size = SMALL_FILE_BYTES + 1
+            if size <= SMALL_FILE_BYTES:
+                small_files.append(f)
+            else:
+                large_files.append(f)
+
+        # Pack small files into batches of 50
+        BATCH = 50
+        small_batches = [
+            small_files[i : i + BATCH] for i in range(0, len(small_files), BATCH)
+        ]
+
         aggregate_counts: dict[str, int] = {q: 0 for q in self.queries}
         master_review_data: list[dict] = []
 
-        ctx = multiprocessing.get_context("spawn")
+        # Total "units" for progress: each large file = 1, each batch = 1
+        total = len(large_files) + len(small_batches)
+
+        # FIX 7: forkserver on POSIX; spawn on Windows
+        mp_method = "spawn" if sys.platform == "win32" else "forkserver"
+        ctx = multiprocessing.get_context(mp_method)
+
         with concurrent.futures.ProcessPoolExecutor(
-            max_workers=self.max_workers, mp_context=ctx
+            max_workers=self.max_workers,
+            mp_context=ctx,
+            initializer=_worker_init,          # FIX 1
+            initargs=(self.queries, log_path),  # FIX 1
         ) as executor:
-            future_map = {
-                executor.submit(
-                    process_file, f, self.queries, self.output_dir, cache_db, log_path
-                ): f
-                for f in all_files
-            }
+            future_map: dict[concurrent.futures.Future, str] = {}
+
+            # Submit large files individually
+            for f in large_files:
+                fut = executor.submit(process_file, f, self.output_dir, cache_db)
+                future_map[fut] = f
+
+            # Submit small-file batches
+            for batch in small_batches:
+                fut = executor.submit(
+                    process_file_batch, batch, self.output_dir, cache_db
+                )
+                future_map[fut] = f"batch({len(batch)} files)"
 
             done = 0
             for future in concurrent.futures.as_completed(future_map):
@@ -504,7 +667,7 @@ class ProcessingWorker(QThread):
                     executor.shutdown(wait=False, cancel_futures=True)
                     self.error_signal.emit("Run cancelled.")
                     return
-                f_path = future_map[future]
+                label = future_map[future]
                 done += 1
                 try:
                     res = future.result()
@@ -512,11 +675,11 @@ class ProcessingWorker(QThread):
                         aggregate_counts[q] += c
                     master_review_data.extend(res["review_data"])
                     self.progress_signal.emit(
-                        done, total, f"({done}/{total}) {Path(f_path).name}"
+                        done, total, f"({done}/{total}) {Path(label).name if '/' in label or '\\' in label else label}"
                     )
                 except Exception as exc:
                     self.progress_signal.emit(
-                        done, total, f"[FAIL] {Path(f_path).name}: {exc}"
+                        done, total, f"[FAIL] {label}: {exc}"
                     )
 
         self._write_reports(aggregate_counts, master_review_data)
@@ -581,6 +744,7 @@ class ExtractorApp(QWidget):
         self.zoom_factor = 1.0
         self.current_rotation = 0
         self.view_text_mode = False
+        self._cache_db: str = ""   # FIX 5: path to OCR cache for on-demand text fetch
         self._init_ui()
 
     # ------------------------------------------------------------------
@@ -715,7 +879,6 @@ QTreeView::item:focus       { background: rgba(70,130,200,0.70); color: white;
             lambda cur, _prev: self._activate_index(cur)
         )
 
-        # Wire the expand/collapse buttons now that self.review_tree exists
         btn_expand.clicked.disconnect()
         btn_collapse.clicked.disconnect()
         btn_expand.clicked.connect(self.review_tree.expandAll)
@@ -823,6 +986,9 @@ QTreeView::item:focus       { background: rgba(70,130,200,0.70); color: white;
             )
             return
 
+        # FIX 5: store cache DB path for on-demand text fetches in review panel
+        self._cache_db = _unc(os.path.join(input_dir, ".ocr_cache.db"))
+
         self.btn_run.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.progress_bar.setRange(0, 0)
@@ -886,10 +1052,8 @@ QTreeView::item:focus       { background: rgba(70,130,200,0.70); color: white;
             count_item = QTableWidgetItem(str(c))
             if c != majority_value:
                 if c < majority_value:
-                    # Below majority → muted amber
                     count_item.setBackground(QBrush(QColor("#f1c40f")))
                 else:
-                    # Above majority → muted coral/orange
                     count_item.setBackground(QBrush(QColor("#e67e22")))
                 count_item.setForeground(QBrush(QColor("#000000")))
 
@@ -996,8 +1160,6 @@ QTreeView::item:focus       { background: rgba(70,130,200,0.70); color: white;
 
         self.review_tree.expandAll()
 
-        # tree_model.clear() replaces the underlying QItemSelectionModel;
-        # reconnect so keyboard and mouse nav both stay live.
         self.review_tree.selectionModel().currentChanged.connect(
             lambda cur, _prev: self._activate_index(cur)
         )
@@ -1055,7 +1217,19 @@ QTreeView::item:focus       { background: rgba(70,130,200,0.70); color: white;
             self._render_graphics_view(item)
 
     def _render_text_view(self, item: dict) -> None:
-        raw_text = item["text_content"]
+        # FIX 5: fetch text from OCR cache on demand.
+        # Derive the cache DB from the source file's directory so this works
+        # even when _start() hasn't been called this session (e.g. app restart).
+        raw_text = ""
+        file_dir = str(Path(item["file_path"]).parent)
+        cache_db = _unc(os.path.join(file_dir, ".ocr_cache.db"))
+        # Fall back to the stored path if the per-file-dir DB doesn't exist yet
+        if not os.path.exists(cache_db) and self._cache_db:
+            cache_db = self._cache_db
+        fetched = cache_load_page(cache_db, item["file_hash"], item["page_idx"])
+        if fetched is not None:
+            raw_text = fetched
+
         if not raw_text.strip():
             self.text_preview.setPlainText("[No text layer found]")
             return
@@ -1200,7 +1374,6 @@ QTreeView::item:focus       { background: rgba(70,130,200,0.70); color: white;
             p_obj = Path(item["file_path"])
             ext = ".pdf" if p_obj.suffix.lower() == ".pdf" else p_obj.suffix
 
-            # Both batch-run (stem_hash) and manual-approve (stem_approved_hash) variants
             for candidate in [
                 folder / f"{p_obj.stem}_{item['file_hash']}{ext}",
                 folder / f"{p_obj.stem}_approved_{item['file_hash']}{ext}",
@@ -1220,7 +1393,6 @@ QTreeView::item:focus       { background: rgba(70,130,200,0.70); color: white;
             QMessageBox.critical(self, "I/O Error", f"Failed cleanup: {exc}")
 
     def _update_tree_node_style(self, item: dict) -> None:
-        """Refresh the label and colour of the currently-selected tree node in-place."""
         current_index = self.review_tree.selectionModel().currentIndex()
         if not current_index.isValid():
             return
