@@ -122,15 +122,21 @@ def _setup_logging(log_path: str | None = None) -> None:
     sh.setFormatter(fmt)
     root.addHandler(sh)
     if log_path:
-        fh = logging.handlers.RotatingFileHandler(
-            log_path,
-            maxBytes=LOG_MAX_BYTES,
-            backupCount=LOG_BACKUP_COUNT,
-            encoding="utf-8",
-        )
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
+        try:
+            # Ensure the output directory exists before opening the log file
+            log_dir = os.path.dirname(log_path.lstrip("\\\\?\\"))
+            os.makedirs(log_dir, exist_ok=True)
+            fh = logging.handlers.RotatingFileHandler(
+                log_path,
+                maxBytes=LOG_MAX_BYTES,
+                backupCount=LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+        except OSError as exc:
+            root.warning("Could not open log file %s: %s — logging to stderr only.", log_path, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +616,7 @@ class ProcessingWorker(QThread):
 
         cache_db = _unc(os.path.join(self.input_dir, ".ocr_cache.db"))
         log_path = _unc(os.path.join(self.output_dir, "extractor.log"))
+        os.makedirs(self.output_dir, exist_ok=True)
         _setup_logging(log_path)
 
         # FIX 8: split into large files (one job each) and small-file batches
